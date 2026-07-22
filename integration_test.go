@@ -25,6 +25,7 @@ const (
 	usdc     = "0x00000000000000000000000000000000usdc0000"
 	usdt     = "0x00000000000000000000000000000000usdt0000"
 	iou1     = "0x0000000000000000000000000000000000iou001"
+	iou2     = "0x0000000000000000000000000000000000iou002"
 	pool     = "0x00000000000000000000000000000000poo10001"
 	alice    = "0x000000000000000000000000000000000a11ce00"
 	bob      = "0x00000000000000000000000000000000000b0b000"
@@ -35,9 +36,10 @@ const (
 
 var allTables = []string{
 	"clear_processed_events", "clear_reserves", "clear_reserve_lp_balances",
-	"clear_reserve_assets", "clear_reserve_swaps", "clear_reserve_activity",
-	"clear_iou_tokens", "clear_iou_balances", "clear_curve_pools",
-	"clear_curve_lp_balances", "clear_curve_swaps", "clear_curve_liquidity",
+	"clear_reserve_assets", "clear_reserve_token_balances", "clear_reserve_swaps",
+	"clear_reserve_activity", "clear_iou_tokens", "clear_iou_balances",
+	"clear_curve_pools", "clear_curve_lp_balances", "clear_curve_swaps",
+	"clear_curve_liquidity",
 }
 
 func mkLog(block, idx uint64, contract, addr, event string, args map[string]string) exporter.LogEvent {
@@ -103,24 +105,36 @@ func TestReplayProtocol(t *testing.T) {
 	const CURVE = "CurveStableSwapNG"
 
 	// A realistic session. Amounts chosen so balances/supply are easy to verify.
+	// The reserve holds two assets (usdc pos 0, usdt pos 1); Deposit/Withdraw carry
+	// a per-asset `amounts` array aligned with that order, so the reserve's physical
+	// ERC20 holdings (clear_reserve_token_balances) can be reconstructed exactly.
 	logs := []exporter.LogEvent{
-		// Reserve setup + Alice/Bob deposits.
+		// Reserve setup: register both assets so amounts[] maps to positions 0/1.
 		mkLog(100, 0, R, reserve, "AssetAdded", map[string]string{"asset": usdc, "decimals": "6", "iou": iou1}),
-		mkLog(100, 1, R, reserve, "Transfer", map[string]string{"from": zeroAddr, "to": alice, "value": "1000"}),
-		mkLog(100, 2, R, reserve, "Deposit", map[string]string{"caller": alice, "receiver": alice, "lpMinted": "1000"}),
+		mkLog(100, 1, R, reserve, "AssetAdded", map[string]string{"asset": usdt, "decimals": "6", "iou": iou2}),
+		// Alice deposit: 1000 LP, 1000 usdc + 1000 usdt in.
+		mkLog(100, 2, R, reserve, "Transfer", map[string]string{"from": zeroAddr, "to": alice, "value": "1000"}),
+		mkLog(100, 3, R, reserve, "Deposit", map[string]string{"caller": alice, "receiver": alice, "lpMinted": "1000", "amounts": `["1000","1000"]`}),
+		// Bob deposit: 500 LP, 500 usdc + 500 usdt in.
 		mkLog(101, 0, R, reserve, "Transfer", map[string]string{"from": zeroAddr, "to": bob, "value": "500"}),
-		mkLog(101, 1, R, reserve, "Deposit", map[string]string{"caller": bob, "receiver": bob, "lpMinted": "500"}),
-		// Alice sends 200 LP to Bob (no supply change).
+		mkLog(101, 1, R, reserve, "Deposit", map[string]string{"caller": bob, "receiver": bob, "lpMinted": "500", "amounts": `["500","500"]`}),
+		// Alice sends 200 LP to Bob (no supply / token change).
 		mkLog(102, 0, R, reserve, "Transfer", map[string]string{"from": alice, "to": bob, "value": "200"}),
-		// Carol does a depeg swap that mints 5 IOU.
+		// Carol depeg swap: 100 usdc in, 95 usdt out, 5 IOU shortfall.
 		mkLog(102, 1, R, reserve, "Swap", map[string]string{
 			"trader": carol, "tokenIn": usdc, "tokenOut": usdt, "recipient": carol,
 			"amountIn": "100", "amountOut": "95", "iouTotal": "5", "traderIOU": "3", "treasuryIOU": "1", "lpIOU": "1"}),
+		// Carol separately mints 5 usdc-IOU (mintIOU): 5 usdc pulled in, 5 IOU minted.
 		mkLog(102, 2, R, reserve, "IOUMinted", map[string]string{"caller": carol, "asset": usdc, "receiver": carol, "amount": "5"}),
 		mkLog(102, 3, IOU, iou1, "Transfer", map[string]string{"from": zeroAddr, "to": carol, "value": "5"}),
-		// Alice withdraws 100 LP (burn).
+		// Alice withdraws 100 LP: 100 usdc + 100 usdt out.
 		mkLog(103, 0, R, reserve, "Transfer", map[string]string{"from": alice, "to": zeroAddr, "value": "100"}),
-		mkLog(103, 1, R, reserve, "Withdraw", map[string]string{"caller": alice, "receiver": alice, "lpBurned": "100"}),
+		mkLog(103, 1, R, reserve, "Withdraw", map[string]string{"caller": alice, "receiver": alice, "lpBurned": "100", "amounts": `["100","100"]`}),
+		// Dave single-asset deposit: 50 usdc in, 1 usdc fee to treasury (net +49), 50 LP.
+		mkLog(103, 2, R, reserve, "Transfer", map[string]string{"from": zeroAddr, "to": dave, "value": "50"}),
+		mkLog(103, 3, R, reserve, "SingleAssetDeposit", map[string]string{"caller": dave, "receiver": dave, "asset": usdc, "amountIn": "50", "fee": "1", "lpMinted": "50"}),
+		// Permissionless rebalance: 30 usdt in, 29 usdc out.
+		mkLog(103, 4, R, reserve, "Rebalanced", map[string]string{"caller": bob, "tokenIn": usdt, "tokenOut": usdc, "recipient": bob, "amountIn": "30", "amountOut": "29"}),
 
 		// Curve pool: Dave adds liquidity, Eve swaps, Dave removes one-sided.
 		// Curve (Vyper) uses sender/receiver on Transfer.
@@ -141,22 +155,31 @@ func TestReplayProtocol(t *testing.T) {
 	}
 
 	// --- reserve state ---
-	// supply = 1000 + 500 - 100(burn) = 1400; deposits = 1500; withdrawals = 100; iou_minted = 5; 1 swap.
+	// supply = 1000 + 500 - 100(burn) + 50(single) = 1450; deposits = 1550;
+	// withdrawals = 100; iou_minted = 5; 1 swap.
 	eq(t, db, "reserve state",
 		`SELECT count(*) FROM clear_reserves WHERE address=$1 AND kind='base'
 		 AND lp_supply=$2 AND total_deposits=$3 AND total_withdrawals=$4
 		 AND iou_minted=$5 AND iou_redeemed=0 AND swap_count=1`,
-		reserve, "1400", "1500", "100", "5")
+		reserve, "1450", "1550", "100", "5")
 
-	// balances: Alice = 1000 - 200 - 100 = 700; Bob = 500 + 200 = 700.
+	// balances: Alice = 1000 - 200 - 100 = 700; Bob = 500 + 200 = 700; Dave = 50.
 	eq(t, db, "alice LP", `SELECT count(*) FROM clear_reserve_lp_balances WHERE reserve=$1 AND holder=$2 AND balance=$3`, reserve, alice, "700")
 	eq(t, db, "bob LP", `SELECT count(*) FROM clear_reserve_lp_balances WHERE reserve=$1 AND holder=$2 AND balance=$3`, reserve, bob, "700")
-	if got := count(t, db, `SELECT COALESCE(sum(balance),0) FROM clear_reserve_lp_balances WHERE reserve=$1`, reserve); got != 1400 {
-		t.Errorf("sum of LP balances = %d, want 1400 (== supply)", got)
+	eq(t, db, "dave LP", `SELECT count(*) FROM clear_reserve_lp_balances WHERE reserve=$1 AND holder=$2 AND balance=$3`, reserve, dave, "50")
+	if got := count(t, db, `SELECT COALESCE(sum(balance),0) FROM clear_reserve_lp_balances WHERE reserve=$1`, reserve); got != 1450 {
+		t.Errorf("sum of LP balances = %d, want 1450 (== supply)", got)
 	}
 
-	// asset registry + IOU.
-	eq(t, db, "asset added", `SELECT count(*) FROM clear_reserve_assets WHERE reserve=$1 AND asset=$2 AND iou=$3 AND decimals=6`, reserve, usdc, iou1)
+	// physical ERC20 holdings (reconstructed from token flows):
+	//   usdc = +1000 +500 +100(swap in) +5(iou mint) -100(withdraw) +49(single net) -29(rebalance out) = 1525
+	//   usdt = +1000 +500 -95(swap out) -100(withdraw) +30(rebalance in)                                = 1335
+	eq(t, db, "usdc holdings", `SELECT count(*) FROM clear_reserve_token_balances WHERE reserve=$1 AND asset=$2 AND balance=$3`, reserve, usdc, "1525")
+	eq(t, db, "usdt holdings", `SELECT count(*) FROM clear_reserve_token_balances WHERE reserve=$1 AND asset=$2 AND balance=$3`, reserve, usdt, "1335")
+
+	// asset registry + IOU; position mirrors assetList order and drives amounts[] mapping.
+	eq(t, db, "asset usdc", `SELECT count(*) FROM clear_reserve_assets WHERE reserve=$1 AND asset=$2 AND iou=$3 AND decimals=6 AND position=0`, reserve, usdc, iou1)
+	eq(t, db, "asset usdt", `SELECT count(*) FROM clear_reserve_assets WHERE reserve=$1 AND asset=$2 AND iou=$3 AND decimals=6 AND position=1`, reserve, usdt, iou2)
 	eq(t, db, "iou supply", `SELECT count(*) FROM clear_iou_tokens WHERE address=$1 AND total_supply=5`, iou1)
 	eq(t, db, "carol iou", `SELECT count(*) FROM clear_iou_balances WHERE token=$1 AND holder=$2 AND balance=5`, iou1, carol)
 
@@ -165,9 +188,10 @@ func TestReplayProtocol(t *testing.T) {
 	if got := count(t, db, `SELECT count(*) FROM clear_reserve_swaps`); got != 1 {
 		t.Errorf("reserve swaps = %d, want 1", got)
 	}
-	// activity: deposit x2, iou_minted x1, withdraw x1 (Swap is NOT activity).
-	if got := count(t, db, `SELECT count(*) FROM clear_reserve_activity`); got != 4 {
-		t.Errorf("reserve activity rows = %d, want 4", got)
+	// activity: deposit x2, iou_minted x1, withdraw x1, single_deposit x1, rebalance x1
+	// (Swap is NOT activity).
+	if got := count(t, db, `SELECT count(*) FROM clear_reserve_activity`); got != 6 {
+		t.Errorf("reserve activity rows = %d, want 6", got)
 	}
 	eq(t, db, "withdraw activity", `SELECT count(*) FROM clear_reserve_activity WHERE action='withdraw' AND caller=$1 AND lp=100`, alice)
 
@@ -185,8 +209,8 @@ func TestReplayProtocol(t *testing.T) {
 
 	// --- idempotency: redelivering logs must not double-apply ---
 	redeliver := []exporter.LogEvent{
-		mkLog(100, 1, R, reserve, "Transfer", map[string]string{"from": zeroAddr, "to": alice, "value": "1000"}),
-		mkLog(100, 2, R, reserve, "Deposit", map[string]string{"caller": alice, "receiver": alice, "lpMinted": "1000"}),
+		mkLog(100, 2, R, reserve, "Transfer", map[string]string{"from": zeroAddr, "to": alice, "value": "1000"}),
+		mkLog(100, 3, R, reserve, "Deposit", map[string]string{"caller": alice, "receiver": alice, "lpMinted": "1000", "amounts": `["1000","1000"]`}),
 	}
 	for _, l := range redeliver {
 		if err := e.NewLogEvent(l); err != nil {
@@ -194,5 +218,6 @@ func TestReplayProtocol(t *testing.T) {
 		}
 	}
 	eq(t, db, "alice LP after redeliver (unchanged)", `SELECT count(*) FROM clear_reserve_lp_balances WHERE reserve=$1 AND holder=$2 AND balance=$3`, reserve, alice, "700")
-	eq(t, db, "reserve supply after redeliver (unchanged)", `SELECT count(*) FROM clear_reserves WHERE address=$1 AND lp_supply=1400 AND total_deposits=1500`, reserve)
+	eq(t, db, "reserve supply after redeliver (unchanged)", `SELECT count(*) FROM clear_reserves WHERE address=$1 AND lp_supply=1450 AND total_deposits=1550`, reserve)
+	eq(t, db, "usdc holdings after redeliver (unchanged)", `SELECT count(*) FROM clear_reserve_token_balances WHERE reserve=$1 AND asset=$2 AND balance=$3`, reserve, usdc, "1525")
 }

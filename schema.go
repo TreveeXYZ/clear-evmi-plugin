@@ -34,13 +34,34 @@ CREATE TABLE IF NOT EXISTS clear_reserve_lp_balances (
 CREATE INDEX IF NOT EXISTS clear_reserve_lp_balances_holder ON clear_reserve_lp_balances (holder);
 
 -- Per-reserve asset registry (from AssetAdded), including the asset's IOU token.
+-- 'position' is the asset's index in the reserve's append-only assetList (== the
+-- AssetAdded emission order), used to map a Deposit/Withdraw amounts[i] back to
+-- its token.
 CREATE TABLE IF NOT EXISTS clear_reserve_assets (
     reserve  TEXT NOT NULL,
     asset    TEXT NOT NULL,
     decimals INT,
     iou      TEXT,
+    position INT,
     PRIMARY KEY (reserve, asset)
 );
+-- Idempotent migration for reserves indexed before 'position' existed.
+ALTER TABLE clear_reserve_assets ADD COLUMN IF NOT EXISTS position INT;
+
+-- Reserve's physical ERC20 holdings, one row per underlying asset, reconstructed
+-- from the token flows in deposit/withdraw/single-asset/rebalance/swap/IOU/flash
+-- events (each moves real tokens in or out of the reserve). BASE reserves only;
+-- exact only when indexing starts at the reserve's deployment (so no flow and no
+-- AssetAdded is missed). This is the true on-chain balanceOf(reserve), unlike the
+-- LP/NAV figures in clear_reserves.
+CREATE TABLE IF NOT EXISTS clear_reserve_token_balances (
+    reserve    TEXT NOT NULL,
+    asset      TEXT NOT NULL,
+    balance    NUMERIC NOT NULL DEFAULT 0,
+    last_block BIGINT,
+    PRIMARY KEY (reserve, asset)
+);
+CREATE INDEX IF NOT EXISTS clear_reserve_token_balances_asset ON clear_reserve_token_balances (asset);
 
 -- Depeg-swap history (the Swap event).
 CREATE TABLE IF NOT EXISTS clear_reserve_swaps (

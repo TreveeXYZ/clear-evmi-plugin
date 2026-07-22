@@ -2,6 +2,8 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
+	"fmt"
 
 	exporter "github.com/evmi-cloud/go-evm-indexer/pkg/exporter"
 )
@@ -106,6 +108,66 @@ func handleTransfer(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	}
 }
 
+// --- reserve physical token balances (base reserves only) ---
+//
+// clear_reserve_token_balances reconstructs the reserve's real ERC20 holdings from
+// the token flows carried by its events. Only base reserves are tracked: their
+// assets come from AssetAdded (positioned in assetList order), whereas a meta
+// reserve holds base-LP + native, which are not in that registry.
+
+// reserveAssetsByPosition returns the reserve's assets keyed by their assetList
+// index, so a Deposit/Withdraw `amounts[i]` can be routed to the right token.
+func reserveAssetsByPosition(tx *sql.Tx, reserve string) (map[int]string, error) {
+	rows, err := tx.Query(`SELECT position, asset FROM clear_reserve_assets WHERE reserve = $1 AND position IS NOT NULL`, reserve)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int]string{}
+	for rows.Next() {
+		var pos int
+		var asset string
+		if err := rows.Scan(&pos, &asset); err != nil {
+			return nil, err
+		}
+		out[pos] = asset
+	}
+	return out, rows.Err()
+}
+
+// applyReserveAmounts adjusts each underlying-token balance from a Deposit/Withdraw
+// `amounts` array (evmi serializes uint256[] as a JSON array of decimal strings),
+// aligned with assetList order. `negate` flips the sign for withdrawals. An index
+// whose asset is unknown (AssetAdded missed because indexing started late) is
+// skipped — its balance would be wrong anyway.
+func applyReserveAmounts(tx *sql.Tx, reserve, amountsJSON string, negate bool, block uint64) error {
+	if amountsJSON == "" {
+		return nil
+	}
+	var amounts []string
+	if err := json.Unmarshal([]byte(amountsJSON), &amounts); err != nil {
+		return fmt.Errorf("amounts array %q: %w", amountsJSON, err)
+	}
+	byPos, err := reserveAssetsByPosition(tx, reserve)
+	if err != nil {
+		return err
+	}
+	for i, amt := range amounts {
+		asset := byPos[i]
+		if asset == "" {
+			continue
+		}
+		delta := amt
+		if negate {
+			delta = neg(amt)
+		}
+		if err := adjustTokenBalance(tx, reserve, asset, delta, block); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- reserve events ---
 
 func insertActivity(tx *sql.Tx, log exporter.LogEvent, reserve, action, caller, receiver, asset, amount, amount2, fee, lp string) error {
@@ -141,6 +203,11 @@ func handleReserveDeposit(tx *sql.Tx, log exporter.LogEvent, k contractKind) err
 		firstArg(a, "baseLpIn", "lpMinted"), num(a, "nativeIn"), "0", numOrZero(lp)); err != nil {
 		return err
 	}
+	if k == baseReserveKind {
+		if err := applyReserveAmounts(tx, reserve, a["amounts"], false, log.BlockNumber); err != nil {
+			return err
+		}
+	}
 	return bumpReserve(tx, reserve, k.reserveType(), "total_deposits", numOrZero(lp), log.BlockNumber)
 }
 
@@ -152,6 +219,11 @@ func handleReserveWithdraw(tx *sql.Tx, log exporter.LogEvent, k contractKind) er
 		normAddr(a["caller"]), normAddr(a["receiver"]), "",
 		firstArg(a, "baseLpOut", "lpBurned"), num(a, "nativeOut"), "0", numOrZero(lp)); err != nil {
 		return err
+	}
+	if k == baseReserveKind {
+		if err := applyReserveAmounts(tx, reserve, a["amounts"], true, log.BlockNumber); err != nil {
+			return err
+		}
 	}
 	return bumpReserve(tx, reserve, k.reserveType(), "total_withdrawals", numOrZero(lp), log.BlockNumber)
 }
@@ -165,6 +237,16 @@ func handleSingleAssetDeposit(tx *sql.Tx, log exporter.LogEvent, k contractKind)
 		num(a, "amountIn"), "0", num(a, "fee"), numOrZero(lp)); err != nil {
 		return err
 	}
+	if k == baseReserveKind {
+		// amountIn pulled in; fee forwarded to treasury — net (amountIn - fee) stays.
+		asset := normAddr(a["asset"])
+		if err := adjustTokenBalance(tx, reserve, asset, num(a, "amountIn"), log.BlockNumber); err != nil {
+			return err
+		}
+		if err := adjustTokenBalance(tx, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
+			return err
+		}
+	}
 	return bumpReserve(tx, reserve, k.reserveType(), "total_deposits", numOrZero(lp), log.BlockNumber)
 }
 
@@ -177,6 +259,16 @@ func handleSingleAssetWithdraw(tx *sql.Tx, log exporter.LogEvent, k contractKind
 		num(a, "amountOut"), "0", num(a, "fee"), numOrZero(lp)); err != nil {
 		return err
 	}
+	if k == baseReserveKind {
+		// amountOut sent to receiver and fee to treasury both leave the reserve.
+		asset := normAddr(a["asset"])
+		if err := adjustTokenBalance(tx, reserve, asset, neg(num(a, "amountOut")), log.BlockNumber); err != nil {
+			return err
+		}
+		if err := adjustTokenBalance(tx, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
+			return err
+		}
+	}
 	return bumpReserve(tx, reserve, k.reserveType(), "total_withdrawals", numOrZero(lp), log.BlockNumber)
 }
 
@@ -185,6 +277,14 @@ func handleRebalanced(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	reserve := normAddr(log.Address)
 	if err := ensureReserve(tx, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
+	}
+	if k == baseReserveKind {
+		if err := adjustTokenBalance(tx, reserve, normAddr(a["tokenIn"]), num(a, "amountIn"), log.BlockNumber); err != nil {
+			return err
+		}
+		if err := adjustTokenBalance(tx, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
+			return err
+		}
 	}
 	return insertActivity(tx, log, reserve, "rebalance",
 		normAddr(a["caller"]), normAddr(a["recipient"]), normAddr(a["tokenIn"]),
@@ -196,6 +296,12 @@ func handleFlashLoan(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	reserve := normAddr(log.Address)
 	if err := ensureReserve(tx, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
+	}
+	if k == baseReserveKind {
+		// Principal is lent and returned within the tx; only the fee stays in the reserve.
+		if err := adjustTokenBalance(tx, reserve, normAddr(a["token"]), num(a, "fee"), log.BlockNumber); err != nil {
+			return err
+		}
 	}
 	return insertActivity(tx, log, reserve, "flash_loan",
 		normAddr(a["initiator"]), normAddr(a["receiver"]), normAddr(a["token"]),
@@ -211,6 +317,12 @@ func handleIOUMinted(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 		amount, "0", "0", "0"); err != nil {
 		return err
 	}
+	if k == baseReserveKind {
+		// mintIOU pulls `amount` of the underlying into the reserve (1:1 backing).
+		if err := adjustTokenBalance(tx, reserve, normAddr(a["asset"]), amount, log.BlockNumber); err != nil {
+			return err
+		}
+	}
 	return bumpReserve(tx, reserve, k.reserveType(), "iou_minted", amount, log.BlockNumber)
 }
 
@@ -222,6 +334,12 @@ func handleIOURedeemed(tx *sql.Tx, log exporter.LogEvent, k contractKind) error 
 		normAddr(a["holder"]), normAddr(a["receiver"]), normAddr(a["asset"]),
 		amount, "0", "0", "0"); err != nil {
 		return err
+	}
+	if k == baseReserveKind {
+		// redeemIOU pays out `amount` of the underlying (par settlement, 1:1).
+		if err := adjustTokenBalance(tx, reserve, normAddr(a["asset"]), neg(amount), log.BlockNumber); err != nil {
+			return err
+		}
 	}
 	return bumpReserve(tx, reserve, k.reserveType(), "iou_redeemed", amount, log.BlockNumber)
 }
@@ -242,6 +360,16 @@ ON CONFLICT (id) DO NOTHING`,
 		num(a, "amountIn"), num(a, "amountOut"), num(a, "iouTotal"), num(a, "traderIOU"), num(a, "treasuryIOU"), num(a, "lpIOU")); err != nil {
 		return err
 	}
+	if k == baseReserveKind {
+		// amountIn of tokenIn received, amountOut of tokenOut paid out. The IOU
+		// shortfall is a claim minted against NAV, not an underlying-token movement.
+		if err := adjustTokenBalance(tx, reserve, normAddr(a["tokenIn"]), num(a, "amountIn"), log.BlockNumber); err != nil {
+			return err
+		}
+		if err := adjustTokenBalance(tx, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
+			return err
+		}
+	}
 	return exec(tx, `UPDATE clear_reserves SET swap_count = swap_count + 1, last_block = $2 WHERE address = $1`,
 		reserve, log.BlockNumber)
 }
@@ -258,8 +386,10 @@ func handleAssetAdded(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 			return err
 		}
 	}
-	return exec(tx, `INSERT INTO clear_reserve_assets (reserve, asset, decimals, iou)
-VALUES ($1, $2, $3, $4)
+	// position = current asset count for the reserve, so it mirrors the contract's
+	// append-only assetList index; kept unchanged on a re-emit (assets are added once).
+	return exec(tx, `INSERT INTO clear_reserve_assets (reserve, asset, decimals, iou, position)
+VALUES ($1, $2, $3, $4, (SELECT count(*) FROM clear_reserve_assets WHERE reserve = $1))
 ON CONFLICT (reserve, asset) DO UPDATE SET decimals = EXCLUDED.decimals, iou = EXCLUDED.iou`,
 		reserve, normAddr(a["asset"]), nullNum(a, "decimals"), nullEmpty(iou))
 }

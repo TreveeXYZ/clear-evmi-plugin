@@ -112,3 +112,18 @@ SET balance = %s.balance + EXCLUDED.balance, last_block = EXCLUDED.last_block`,
 	_, err := tx.Exec(q, owner, holder, delta, block)
 	return err
 }
+
+// adjustTokenBalance upserts a base reserve's physical holding of one underlying
+// asset by a signed decimal delta. Additive like adjustBalance (so it stays exact
+// under the exactly-once ledger); a zero/empty delta or missing asset is a no-op.
+func adjustTokenBalance(tx *sql.Tx, reserve, asset, delta string, block uint64) error {
+	if asset == "" || delta == "" || delta == "0" || delta == "-0" {
+		return nil
+	}
+	_, err := tx.Exec(`INSERT INTO clear_reserve_token_balances (reserve, asset, balance, last_block)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (reserve, asset) DO UPDATE
+SET balance = clear_reserve_token_balances.balance + EXCLUDED.balance, last_block = EXCLUDED.last_block`,
+		reserve, asset, delta, block)
+	return err
+}

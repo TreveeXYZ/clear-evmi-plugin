@@ -139,6 +139,33 @@ CREATE TABLE IF NOT EXISTS clear_oracle_prices (
     last_block       BIGINT
 );
 
+-- Oracle price time series: one row per ClearOracleRateChanged (every price write,
+-- including Pyth-driven ones, funnels through it). Append-only, for charting price
+-- history. block_timestamp is the block-header unix seconds.
+CREATE TABLE IF NOT EXISTS clear_oracle_price_history (
+    id              TEXT PRIMARY KEY,
+    asset           TEXT NOT NULL,
+    block_number    BIGINT NOT NULL,
+    block_timestamp BIGINT,
+    price           NUMERIC
+);
+CREATE INDEX IF NOT EXISTS clear_oracle_price_history_asset ON clear_oracle_price_history (asset, block_number);
+
+-- Reserve value time series (BASE reserves), DAILY granularity: one row per reserve
+-- per UTC day (day = the block-timestamp's date). total_assets = Σ balance*10^(18-
+-- decimals) (par-valued gross holdings, 18-dec — the contract's totalAssets()) and
+-- total_supply (LP supply). Each row holds the LAST (highest-block) snapshot of that
+-- day, so it's the end-of-day value. For charting TVL / supply over time.
+CREATE TABLE IF NOT EXISTS clear_reserve_value_history (
+    reserve         TEXT NOT NULL,
+    day             DATE NOT NULL,
+    block_number    BIGINT,
+    block_timestamp BIGINT,
+    total_assets    NUMERIC,
+    total_supply    NUMERIC,
+    PRIMARY KEY (reserve, day)
+);
+
 -- Curve StableSwap-NG pools (IOU secondary market; LP token IS the pool).
 CREATE TABLE IF NOT EXISTS clear_curve_pools (
     address     TEXT PRIMARY KEY,

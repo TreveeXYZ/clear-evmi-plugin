@@ -37,9 +37,10 @@ const (
 var allTables = []string{
 	"clear_processed_events", "clear_reserves", "clear_reserve_lp_balances",
 	"clear_reserve_assets", "clear_reserve_token_balances", "clear_reserve_swaps",
-	"clear_reserve_activity", "clear_iou_tokens", "clear_iou_balances",
-	"clear_oracle_prices", "clear_curve_pools", "clear_curve_lp_balances",
-	"clear_curve_swaps", "clear_curve_liquidity",
+	"clear_reserve_activity", "clear_reserve_value_history", "clear_iou_tokens",
+	"clear_iou_balances", "clear_oracle_prices", "clear_oracle_price_history",
+	"clear_curve_pools", "clear_curve_lp_balances", "clear_curve_swaps",
+	"clear_curve_liquidity",
 }
 
 // blockTs is the synthetic block-header timestamp for a block (unix seconds).
@@ -194,6 +195,17 @@ func TestReplayProtocol(t *testing.T) {
 	eq(t, db, "usdc holdings", `SELECT count(*) FROM clear_reserve_token_balances WHERE reserve=$1 AND asset=$2 AND balance=$3`, reserve, usdc, "1525")
 	eq(t, db, "usdt holdings", `SELECT count(*) FROM clear_reserve_token_balances WHERE reserve=$1 AND asset=$2 AND balance=$3`, reserve, usdt, "1335")
 
+	// value history is DAILY: all reserve events fall on one UTC day, so the 7 flow
+	// events collapse into a single row holding the end-of-day (last, block 103)
+	// value. total_assets is par-valued 18-dec: (1525 + 1335) 6-dec * 10^12 = 2.86e15;
+	// total_supply 1450.
+	eq(t, db, "reserve daily value", `SELECT count(*) FROM clear_reserve_value_history
+		WHERE reserve=$1 AND day=(to_timestamp($2) AT TIME ZONE 'UTC')::date AND block_number=103
+		AND total_assets=2860000000000000 AND total_supply=1450`, reserve, blockTs(103))
+	if got := count(t, db, `SELECT count(*) FROM clear_reserve_value_history WHERE reserve=$1`, reserve); got != 1 {
+		t.Errorf("reserve daily rows = %d, want 1 (all events same day)", got)
+	}
+
 	// asset registry + IOU; position mirrors assetList order and drives amounts[] mapping.
 	// usdc's IOU (iou1) minted 5 to Carol; usdt's IOU (iou2) is untouched → 0. The
 	// iou_supply column mirrors clear_iou_tokens.total_supply for the linked IOU.
@@ -225,6 +237,15 @@ func TestReplayProtocol(t *testing.T) {
 		AND price_ttl=3600 AND price=99990000 AND redemption_price=100000000
 		AND last_refresh=$3 AND last_block=107`,
 		usdc, oracleAddr, blockTs(107))
+
+	// price history: one point per ClearOracleRateChanged (block 106); the adapter's
+	// PriceUpdated does not add a second point.
+	eq(t, db, "oracle price point", `SELECT count(*) FROM clear_oracle_price_history
+		WHERE id='1:106:1' AND asset=$1 AND block_number=106 AND block_timestamp=$2 AND price=99990000`,
+		usdc, blockTs(106))
+	if got := count(t, db, `SELECT count(*) FROM clear_oracle_price_history WHERE asset=$1`, usdc); got != 1 {
+		t.Errorf("oracle price points = %d, want 1", got)
+	}
 
 	// --- curve state ---
 	// supply = 1000 - 200 = 800; 1 swap.

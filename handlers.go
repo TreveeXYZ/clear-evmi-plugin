@@ -176,6 +176,31 @@ func applyReserveAmounts(tx *sql.Tx, reserve, amountsJSON string, negate bool, b
 	return nil
 }
 
+// snapshotReserveValue writes the reserve's daily value point for charting:
+// total_assets = Σ balance*10^(18-decimals) (par-valued gross holdings, 18-dec —
+// the contract's totalAssets()) and total_supply (LP supply), bucketed by the UTC
+// day of the block timestamp. One row per (reserve, day); the guard keeps the
+// highest-block snapshot so each day holds its end-of-day value. Base reserves
+// only. Call it after this event's balances/supply are applied.
+func snapshotReserveValue(tx *sql.Tx, reserve string, log exporter.LogEvent) error {
+	_, err := tx.Exec(`INSERT INTO clear_reserve_value_history
+(reserve, day, block_number, block_timestamp, total_assets, total_supply)
+SELECT $1, (to_timestamp($2) AT TIME ZONE 'UTC')::date, $3, $2,
+  COALESCE((SELECT sum(b.balance * power(10::numeric, 18 - COALESCE(a.decimals, 18)))
+            FROM clear_reserve_token_balances b
+            JOIN clear_reserve_assets a ON a.reserve = b.reserve AND a.asset = b.asset
+            WHERE b.reserve = $1), 0),
+  COALESCE((SELECT lp_supply FROM clear_reserves WHERE address = $1), 0)
+ON CONFLICT (reserve, day) DO UPDATE SET
+  block_number = EXCLUDED.block_number,
+  block_timestamp = EXCLUDED.block_timestamp,
+  total_assets = EXCLUDED.total_assets,
+  total_supply = EXCLUDED.total_supply
+WHERE clear_reserve_value_history.block_number <= EXCLUDED.block_number`,
+		reserve, log.BlockTimestamp, log.BlockNumber)
+	return err
+}
+
 // --- reserve events ---
 
 func insertActivity(tx *sql.Tx, log exporter.LogEvent, reserve, action, caller, receiver, asset, amount, amount2, fee, lp string) error {
@@ -215,6 +240,9 @@ func handleReserveDeposit(tx *sql.Tx, log exporter.LogEvent, k contractKind) err
 		if err := applyReserveAmounts(tx, reserve, a["amounts"], false, log.BlockNumber); err != nil {
 			return err
 		}
+		if err := snapshotReserveValue(tx, reserve, log); err != nil {
+			return err
+		}
 	}
 	return bumpReserve(tx, reserve, k.reserveType(), "total_deposits", numOrZero(lp), log.BlockNumber)
 }
@@ -230,6 +258,9 @@ func handleReserveWithdraw(tx *sql.Tx, log exporter.LogEvent, k contractKind) er
 	}
 	if k == baseReserveKind {
 		if err := applyReserveAmounts(tx, reserve, a["amounts"], true, log.BlockNumber); err != nil {
+			return err
+		}
+		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
@@ -254,6 +285,9 @@ func handleSingleAssetDeposit(tx *sql.Tx, log exporter.LogEvent, k contractKind)
 		if err := adjustTokenBalance(tx, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
 			return err
 		}
+		if err := snapshotReserveValue(tx, reserve, log); err != nil {
+			return err
+		}
 	}
 	return bumpReserve(tx, reserve, k.reserveType(), "total_deposits", numOrZero(lp), log.BlockNumber)
 }
@@ -276,6 +310,9 @@ func handleSingleAssetWithdraw(tx *sql.Tx, log exporter.LogEvent, k contractKind
 		if err := adjustTokenBalance(tx, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
 			return err
 		}
+		if err := snapshotReserveValue(tx, reserve, log); err != nil {
+			return err
+		}
 	}
 	return bumpReserve(tx, reserve, k.reserveType(), "total_withdrawals", numOrZero(lp), log.BlockNumber)
 }
@@ -293,6 +330,9 @@ func handleRebalanced(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 		if err := adjustTokenBalance(tx, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
 			return err
 		}
+		if err := snapshotReserveValue(tx, reserve, log); err != nil {
+			return err
+		}
 	}
 	return insertActivity(tx, log, reserve, "rebalance",
 		normAddr(a["caller"]), normAddr(a["recipient"]), normAddr(a["tokenIn"]),
@@ -308,6 +348,9 @@ func handleFlashLoan(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	if k == baseReserveKind {
 		// Principal is lent and returned within the tx; only the fee stays in the reserve.
 		if err := adjustTokenBalance(tx, reserve, normAddr(a["token"]), num(a, "fee"), log.BlockNumber); err != nil {
+			return err
+		}
+		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
@@ -330,6 +373,9 @@ func handleIOUMinted(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 		if err := adjustTokenBalance(tx, reserve, normAddr(a["asset"]), amount, log.BlockNumber); err != nil {
 			return err
 		}
+		if err := snapshotReserveValue(tx, reserve, log); err != nil {
+			return err
+		}
 	}
 	return bumpReserve(tx, reserve, k.reserveType(), "iou_minted", amount, log.BlockNumber)
 }
@@ -346,6 +392,9 @@ func handleIOURedeemed(tx *sql.Tx, log exporter.LogEvent, k contractKind) error 
 	if k == baseReserveKind {
 		// redeemIOU pays out `amount` of the underlying (par settlement, 1:1).
 		if err := adjustTokenBalance(tx, reserve, normAddr(a["asset"]), neg(amount), log.BlockNumber); err != nil {
+			return err
+		}
+		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
@@ -375,6 +424,9 @@ ON CONFLICT (id) DO NOTHING`,
 			return err
 		}
 		if err := adjustTokenBalance(tx, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
+			return err
+		}
+		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
@@ -506,12 +558,18 @@ func handleOracleRate(tx *sql.Tx, log exporter.LogEvent) error {
 	if asset == "" {
 		return nil
 	}
-	return exec(tx, `INSERT INTO clear_oracle_prices (asset, oracle, price, last_refresh, last_block)
+	if err := exec(tx, `INSERT INTO clear_oracle_prices (asset, oracle, price, last_refresh, last_block)
 VALUES ($1,$2,$3,$4,$5)
 ON CONFLICT (asset) DO UPDATE SET
   oracle = EXCLUDED.oracle, price = EXCLUDED.price,
   last_refresh = EXCLUDED.last_refresh, last_block = EXCLUDED.last_block`,
-		asset, normAddr(log.Address), num(a, "price"), log.BlockTimestamp, log.BlockNumber)
+		asset, normAddr(log.Address), num(a, "price"), log.BlockTimestamp, log.BlockNumber); err != nil {
+		return err
+	}
+	// Append the price point for charting (every price write emits this event).
+	return exec(tx, `INSERT INTO clear_oracle_price_history (id, asset, block_number, block_timestamp, price)
+VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO NOTHING`,
+		log.Id, asset, log.BlockNumber, log.BlockTimestamp, num(a, "price"))
 }
 
 func handleOracleRedemption(tx *sql.Tx, log exporter.LogEvent) error {

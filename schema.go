@@ -38,15 +38,17 @@ CREATE INDEX IF NOT EXISTS clear_reserve_lp_balances_holder ON clear_reserve_lp_
 -- AssetAdded emission order), used to map a Deposit/Withdraw amounts[i] back to
 -- its token.
 CREATE TABLE IF NOT EXISTS clear_reserve_assets (
-    reserve  TEXT NOT NULL,
-    asset    TEXT NOT NULL,
-    decimals INT,
-    iou      TEXT,
-    position INT,
+    reserve    TEXT NOT NULL,
+    asset      TEXT NOT NULL,
+    decimals   INT,
+    iou        TEXT,
+    position   INT,
+    iou_supply NUMERIC NOT NULL DEFAULT 0,
     PRIMARY KEY (reserve, asset)
 );
--- Idempotent migration for reserves indexed before 'position' existed.
+-- Idempotent migrations for reserves indexed before these columns existed.
 ALTER TABLE clear_reserve_assets ADD COLUMN IF NOT EXISTS position INT;
+ALTER TABLE clear_reserve_assets ADD COLUMN IF NOT EXISTS iou_supply NUMERIC NOT NULL DEFAULT 0;
 
 -- Reserve's physical ERC20 holdings, one row per underlying asset, reconstructed
 -- from the token flows in deposit/withdraw/single-asset/rebalance/swap/IOU/flash

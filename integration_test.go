@@ -178,8 +178,10 @@ func TestReplayProtocol(t *testing.T) {
 	eq(t, db, "usdt holdings", `SELECT count(*) FROM clear_reserve_token_balances WHERE reserve=$1 AND asset=$2 AND balance=$3`, reserve, usdt, "1335")
 
 	// asset registry + IOU; position mirrors assetList order and drives amounts[] mapping.
-	eq(t, db, "asset usdc", `SELECT count(*) FROM clear_reserve_assets WHERE reserve=$1 AND asset=$2 AND iou=$3 AND decimals=6 AND position=0`, reserve, usdc, iou1)
-	eq(t, db, "asset usdt", `SELECT count(*) FROM clear_reserve_assets WHERE reserve=$1 AND asset=$2 AND iou=$3 AND decimals=6 AND position=1`, reserve, usdt, iou2)
+	// usdc's IOU (iou1) minted 5 to Carol; usdt's IOU (iou2) is untouched → 0. The
+	// iou_supply column mirrors clear_iou_tokens.total_supply for the linked IOU.
+	eq(t, db, "asset usdc", `SELECT count(*) FROM clear_reserve_assets WHERE reserve=$1 AND asset=$2 AND iou=$3 AND decimals=6 AND position=0 AND iou_supply=5`, reserve, usdc, iou1)
+	eq(t, db, "asset usdt", `SELECT count(*) FROM clear_reserve_assets WHERE reserve=$1 AND asset=$2 AND iou=$3 AND decimals=6 AND position=1 AND iou_supply=0`, reserve, usdt, iou2)
 	eq(t, db, "iou supply", `SELECT count(*) FROM clear_iou_tokens WHERE address=$1 AND total_supply=5`, iou1)
 	eq(t, db, "carol iou", `SELECT count(*) FROM clear_iou_balances WHERE token=$1 AND holder=$2 AND balance=5`, iou1, carol)
 

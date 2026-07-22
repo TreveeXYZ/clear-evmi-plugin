@@ -85,8 +85,15 @@ func handleTransfer(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 		supplyCol = "total_supply"
 	}
 	addSupply := func(delta string) error {
-		return exec(tx, "UPDATE "+parentTable+" SET "+supplyCol+" = "+supplyCol+" + $2, last_block = $3 WHERE address = $1",
-			owner, delta, block)
+		if err := exec(tx, "UPDATE "+parentTable+" SET "+supplyCol+" = "+supplyCol+" + $2, last_block = $3 WHERE address = $1",
+			owner, delta, block); err != nil {
+			return err
+		}
+		// Mirror IOU supply onto its reserve-asset registry row (1 IOU per asset).
+		if k == iouKind {
+			return exec(tx, "UPDATE clear_reserve_assets SET iou_supply = iou_supply + $2 WHERE iou = $1", owner, delta)
+		}
+		return nil
 	}
 
 	switch {

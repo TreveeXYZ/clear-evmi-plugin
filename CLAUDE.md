@@ -53,3 +53,5 @@ The whole pipeline is small (`main.go`, `schema.go`, `db.go`, `handlers.go`) but
 Two things make it work: (1) the `Deposit`/`Withdraw` `amounts` array is aligned with the contract's append-only `assetList`, so `clear_reserve_assets.position` (assigned from the asset count at `AssetAdded` time) maps `amounts[i]` back to its token; (2) all deltas are gated to `k == baseReserveKind` — **meta reserves are not tracked** (they hold base-LP + native, which aren't in the `AssetAdded` registry, and their `Deposit` carries no `amounts`). Exact only when indexing starts at the reserve's deployment (no missed flow, no missed `AssetAdded`).
 
 The plugin does **not** reconstruct meta-reserve token holdings or the underlying tokens' own ERC20 `Transfer`s (those aren't reserve events).
+
+`clear_reserve_assets.iou_supply` mirrors each asset's IOU `total_supply`: the IOU `Transfer` mint/burn path in `handleTransfer` updates both `clear_iou_tokens` (keyed by IOU address) and the registry row (`WHERE iou = <addr>`) in lockstep, so per-asset IOU supply is available without a join.

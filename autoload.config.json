@@ -47,6 +47,14 @@
       {
         "contractName": "CurveStableSwapNG",
         "content": "[{\"type\":\"event\",\"name\":\"Transfer\",\"anonymous\":false,\"inputs\":[{\"name\":\"sender\",\"type\":\"address\",\"indexed\":true},{\"name\":\"receiver\",\"type\":\"address\",\"indexed\":true},{\"name\":\"value\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"TokenExchange\",\"anonymous\":false,\"inputs\":[{\"name\":\"buyer\",\"type\":\"address\",\"indexed\":true},{\"name\":\"sold_id\",\"type\":\"int128\",\"indexed\":false},{\"name\":\"tokens_sold\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"bought_id\",\"type\":\"int128\",\"indexed\":false},{\"name\":\"tokens_bought\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"TokenExchangeUnderlying\",\"anonymous\":false,\"inputs\":[{\"name\":\"buyer\",\"type\":\"address\",\"indexed\":true},{\"name\":\"sold_id\",\"type\":\"int128\",\"indexed\":false},{\"name\":\"tokens_sold\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"bought_id\",\"type\":\"int128\",\"indexed\":false},{\"name\":\"tokens_bought\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"AddLiquidity\",\"anonymous\":false,\"inputs\":[{\"name\":\"provider\",\"type\":\"address\",\"indexed\":true},{\"name\":\"token_amounts\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"fees\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"invariant\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"token_supply\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"RemoveLiquidity\",\"anonymous\":false,\"inputs\":[{\"name\":\"provider\",\"type\":\"address\",\"indexed\":true},{\"name\":\"token_amounts\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"fees\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"token_supply\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"RemoveLiquidityOne\",\"anonymous\":false,\"inputs\":[{\"name\":\"provider\",\"type\":\"address\",\"indexed\":true},{\"name\":\"token_id\",\"type\":\"int128\",\"indexed\":false},{\"name\":\"token_amount\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"coin_amount\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"token_supply\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"RemoveLiquidityImbalance\",\"anonymous\":false,\"inputs\":[{\"name\":\"provider\",\"type\":\"address\",\"indexed\":true},{\"name\":\"token_amounts\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"fees\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"invariant\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"token_supply\",\"type\":\"uint256\",\"indexed\":false}]}]"
+      },
+      {
+        "contractName": "ClearOracle",
+        "content": "[{\"type\":\"event\",\"name\":\"OracleConfigured\",\"anonymous\":false,\"inputs\":[{\"name\":\"enabled\",\"type\":\"bool\",\"indexed\":true},{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"assetDecimals\",\"type\":\"uint8\",\"indexed\":false},{\"name\":\"oracleDecimals\",\"type\":\"uint8\",\"indexed\":false},{\"name\":\"priceTTL\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"redemptionPrice\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"ClearOracleRateChanged\",\"anonymous\":false,\"inputs\":[{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"price\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"ClearOracleRedemptionPriceChanged\",\"anonymous\":false,\"inputs\":[{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"redemptionPrice\",\"type\":\"uint256\",\"indexed\":false}]}]"
+      },
+      {
+        "contractName": "PythOracleAdapter",
+        "content": "[{\"type\":\"event\",\"name\":\"PriceUpdated\",\"anonymous\":false,\"inputs\":[{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"price\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"publishTime\",\"type\":\"uint256\",\"indexed\":false}]}]"
       }
     ],
     "stores": [
@@ -99,6 +107,22 @@
         "enabled": true,
         "startBlock": 0,
         "address": "0x0000000000000000000000000000000000000003"
+      },
+      {
+        "pipeline": "clear",
+        "abi": "ClearOracle",
+        "type": "CONTRACT",
+        "enabled": true,
+        "startBlock": 0,
+        "address": "0x0000000000000000000000000000000000000004"
+      },
+      {
+        "pipeline": "clear",
+        "abi": "PythOracleAdapter",
+        "type": "CONTRACT",
+        "enabled": true,
+        "startBlock": 0,
+        "address": "0x0000000000000000000000000000000000000005"
       }
     ],
     "exporters": [

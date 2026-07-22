@@ -165,6 +165,16 @@ func dispatch(tx *sql.Tx, log exporter.LogEvent) error {
 		return handleCurveSwap(tx, log, false)
 	case "TokenExchangeUnderlying":
 		return handleCurveSwap(tx, log, true)
+	// Oracle state (per-asset config, price, redemption, refresh time).
+	case "OracleConfigured":
+		return handleOracleConfigured(tx, log)
+	case "ClearOracleRateChanged":
+		return handleOracleRate(tx, log)
+	case "ClearOracleRedemptionPriceChanged":
+		return handleOracleRedemption(tx, log)
+	case "PriceUpdated":
+		return handleOraclePublish(tx, log)
+
 	case "AddLiquidity":
 		return handleCurveLiquidity(tx, log, "add")
 	case "RemoveLiquidity":

@@ -21,11 +21,14 @@ const (
 	metaReserveKind
 	iouKind
 	curveKind
+	oracleKind
 )
 
 func classify(contractName string) contractKind {
 	n := strings.ToLower(contractName)
 	switch {
+	case strings.Contains(n, "oracle"):
+		return oracleKind
 	case strings.Contains(n, "meta") && strings.Contains(n, "reserve"):
 		return metaReserveKind
 	case strings.Contains(n, "base") && strings.Contains(n, "reserve"):

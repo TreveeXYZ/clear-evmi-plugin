@@ -120,6 +120,25 @@ CREATE TABLE IF NOT EXISTS clear_iou_balances (
 );
 CREATE INDEX IF NOT EXISTS clear_iou_balances_holder ON clear_iou_balances (holder);
 
+-- Oracle state, one row per asset. Config comes from OracleConfigured; price from
+-- ClearOracleRateChanged; redemption_price from ClearOracleRedemptionPriceChanged
+-- (all on the ClearOracle contract) plus the PythOracleAdapter's PriceUpdated.
+-- last_refresh is the block-header timestamp (unix seconds) of the most recent
+-- oracle event — the "last refresh date". last_block is the same event's block
+-- number. Keyed by asset so both contracts fold into the same row.
+CREATE TABLE IF NOT EXISTS clear_oracle_prices (
+    asset            TEXT PRIMARY KEY,
+    oracle           TEXT,
+    enabled          BOOLEAN,
+    asset_decimals   INT,
+    oracle_decimals  INT,
+    price_ttl        NUMERIC,
+    price            NUMERIC,
+    redemption_price NUMERIC,
+    last_refresh     BIGINT,
+    last_block       BIGINT
+);
+
 -- Curve StableSwap-NG pools (IOU secondary market; LP token IS the pool).
 CREATE TABLE IF NOT EXISTS clear_curve_pools (
     address     TEXT PRIMARY KEY,

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	exporter "github.com/evmi-cloud/go-evm-indexer/pkg/exporter"
 )
@@ -446,4 +447,98 @@ func numOrZero(v string) string {
 		return "0"
 	}
 	return v
+}
+
+// --- oracle state (one row per asset, keyed by asset) ---
+//
+// The ClearOracle emits config (OracleConfigured), price (ClearOracleRateChanged)
+// and redemption price (ClearOracleRedemptionPriceChanged); the PythOracleAdapter
+// emits PriceUpdated. All four fold into clear_oracle_prices by asset, and each
+// stamps last_refresh with the event's block timestamp (the last refresh date).
+// Each handler upserts only its own columns so it can create the row or patch an
+// existing one in any order.
+
+// parseBool decodes an indexed bool arg, tolerating "true"/"false", "1"/"0" and the
+// 32-byte hex word form evmi may hand back. Absent -> NULL.
+func parseBool(s string) sql.NullBool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return sql.NullBool{}
+	}
+	switch s {
+	case "true", "1", "0x1":
+		return sql.NullBool{Bool: true, Valid: true}
+	case "false", "0", "0x0":
+		return sql.NullBool{Bool: false, Valid: true}
+	}
+	if strings.HasPrefix(s, "0x") { // hex word: any non-zero digit => true
+		return sql.NullBool{Bool: strings.Trim(s[2:], "0") != "", Valid: true}
+	}
+	return sql.NullBool{}
+}
+
+func handleOracleConfigured(tx *sql.Tx, log exporter.LogEvent) error {
+	a := log.Args
+	asset := normAddr(a["asset"])
+	if asset == "" {
+		return nil
+	}
+	return exec(tx, `INSERT INTO clear_oracle_prices
+(asset, oracle, enabled, asset_decimals, oracle_decimals, price_ttl, redemption_price, last_refresh, last_block)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+ON CONFLICT (asset) DO UPDATE SET
+  oracle = EXCLUDED.oracle,
+  enabled = EXCLUDED.enabled,
+  asset_decimals = EXCLUDED.asset_decimals,
+  oracle_decimals = EXCLUDED.oracle_decimals,
+  price_ttl = EXCLUDED.price_ttl,
+  redemption_price = EXCLUDED.redemption_price,
+  last_refresh = EXCLUDED.last_refresh,
+  last_block = EXCLUDED.last_block`,
+		asset, normAddr(log.Address), parseBool(a["enabled"]),
+		nullNum(a, "assetDecimals"), nullNum(a, "oracleDecimals"),
+		nullNum(a, "priceTTL"), nullNum(a, "redemptionPrice"), log.BlockTimestamp, log.BlockNumber)
+}
+
+func handleOracleRate(tx *sql.Tx, log exporter.LogEvent) error {
+	a := log.Args
+	asset := normAddr(a["asset"])
+	if asset == "" {
+		return nil
+	}
+	return exec(tx, `INSERT INTO clear_oracle_prices (asset, oracle, price, last_refresh, last_block)
+VALUES ($1,$2,$3,$4,$5)
+ON CONFLICT (asset) DO UPDATE SET
+  oracle = EXCLUDED.oracle, price = EXCLUDED.price,
+  last_refresh = EXCLUDED.last_refresh, last_block = EXCLUDED.last_block`,
+		asset, normAddr(log.Address), num(a, "price"), log.BlockTimestamp, log.BlockNumber)
+}
+
+func handleOracleRedemption(tx *sql.Tx, log exporter.LogEvent) error {
+	a := log.Args
+	asset := normAddr(a["asset"])
+	if asset == "" {
+		return nil
+	}
+	return exec(tx, `INSERT INTO clear_oracle_prices (asset, redemption_price, last_refresh, last_block)
+VALUES ($1,$2,$3,$4)
+ON CONFLICT (asset) DO UPDATE SET
+  redemption_price = EXCLUDED.redemption_price,
+  last_refresh = EXCLUDED.last_refresh, last_block = EXCLUDED.last_block`,
+		asset, num(a, "redemptionPrice"), log.BlockTimestamp, log.BlockNumber)
+}
+
+// handleOraclePublish records the adapter's price refresh. It does not overwrite
+// `oracle` — log.Address here is the adapter, not the ClearOracle.
+func handleOraclePublish(tx *sql.Tx, log exporter.LogEvent) error {
+	a := log.Args
+	asset := normAddr(a["asset"])
+	if asset == "" {
+		return nil
+	}
+	return exec(tx, `INSERT INTO clear_oracle_prices (asset, price, last_refresh, last_block)
+VALUES ($1,$2,$3,$4)
+ON CONFLICT (asset) DO UPDATE SET
+  price = EXCLUDED.price, last_refresh = EXCLUDED.last_refresh, last_block = EXCLUDED.last_block`,
+		asset, num(a, "price"), log.BlockTimestamp, log.BlockNumber)
 }

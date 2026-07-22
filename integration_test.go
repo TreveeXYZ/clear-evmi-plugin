@@ -38,9 +38,12 @@ var allTables = []string{
 	"clear_processed_events", "clear_reserves", "clear_reserve_lp_balances",
 	"clear_reserve_assets", "clear_reserve_token_balances", "clear_reserve_swaps",
 	"clear_reserve_activity", "clear_iou_tokens", "clear_iou_balances",
-	"clear_curve_pools", "clear_curve_lp_balances", "clear_curve_swaps",
-	"clear_curve_liquidity",
+	"clear_oracle_prices", "clear_curve_pools", "clear_curve_lp_balances",
+	"clear_curve_swaps", "clear_curve_liquidity",
 }
+
+// blockTs is the synthetic block-header timestamp for a block (unix seconds).
+func blockTs(block uint64) uint64 { return 1_700_000_000 + block }
 
 func mkLog(block, idx uint64, contract, addr, event string, args map[string]string) exporter.LogEvent {
 	return exporter.LogEvent{
@@ -51,6 +54,7 @@ func mkLog(block, idx uint64, contract, addr, event string, args map[string]stri
 		Address:         addr,
 		Args:            args,
 		BlockNumber:     block,
+		BlockTimestamp:  blockTs(block),
 		LogIndex:        idx,
 		TransactionHash: fmt.Sprintf("0xtx%d%d", block, idx),
 	}
@@ -103,6 +107,10 @@ func TestReplayProtocol(t *testing.T) {
 	const R = "ClearBaseReserve"
 	const IOU = "ClearIOU"
 	const CURVE = "CurveStableSwapNG"
+	const ORACLE = "ClearOracle"
+	const ADAPTER = "PythOracleAdapter"
+	const oracleAddr = "0x0000000000000000000000000000000000rac1e"
+	const adapterAddr = "0x00000000000000000000000000000000adap7e0"
 
 	// A realistic session. Amounts chosen so balances/supply are easy to verify.
 	// The reserve holds two assets (usdc pos 0, usdt pos 1); Deposit/Withdraw carry
@@ -146,6 +154,15 @@ func TestReplayProtocol(t *testing.T) {
 		mkLog(105, 0, CURVE, pool, "Transfer", map[string]string{"sender": dave, "receiver": zeroAddr, "value": "200"}),
 		mkLog(105, 1, CURVE, pool, "RemoveLiquidityOne", map[string]string{
 			"provider": dave, "token_id": "0", "token_amount": "200", "coin_amount": "200", "token_supply": "800"}),
+
+		// Oracle: configure usdc, push a price, set redemption, then a Pyth refresh
+		// (PriceUpdated on the adapter carries the publishTime = last refresh date).
+		mkLog(106, 0, ORACLE, oracleAddr, "OracleConfigured", map[string]string{
+			"enabled": "true", "asset": usdc, "assetDecimals": "6", "oracleDecimals": "8",
+			"priceTTL": "3600", "redemptionPrice": "100000000"}),
+		mkLog(106, 1, ORACLE, oracleAddr, "ClearOracleRateChanged", map[string]string{"asset": usdc, "price": "99990000"}),
+		mkLog(106, 2, ORACLE, oracleAddr, "ClearOracleRedemptionPriceChanged", map[string]string{"asset": usdc, "redemptionPrice": "100000000"}),
+		mkLog(107, 0, ADAPTER, adapterAddr, "PriceUpdated", map[string]string{"asset": usdc, "price": "99990000", "publishTime": "1721600000"}),
 	}
 
 	for _, l := range logs {
@@ -196,6 +213,18 @@ func TestReplayProtocol(t *testing.T) {
 		t.Errorf("reserve activity rows = %d, want 6", got)
 	}
 	eq(t, db, "withdraw activity", `SELECT count(*) FROM clear_reserve_activity WHERE action='withdraw' AND caller=$1 AND lp=100`, alice)
+
+	// --- oracle state ---
+	// Config folds in from OracleConfigured, price from ClearOracleRateChanged,
+	// redemption from ClearOracleRedemptionPriceChanged; last_refresh is the block
+	// timestamp of the latest oracle event (the adapter's PriceUpdated at block 107).
+	// `oracle` stays the ClearOracle address (the adapter's PriceUpdated must not
+	// clobber it).
+	eq(t, db, "oracle usdc", `SELECT count(*) FROM clear_oracle_prices
+		WHERE asset=$1 AND oracle=$2 AND enabled=true AND asset_decimals=6 AND oracle_decimals=8
+		AND price_ttl=3600 AND price=99990000 AND redemption_price=100000000
+		AND last_refresh=$3 AND last_block=107`,
+		usdc, oracleAddr, blockTs(107))
 
 	// --- curve state ---
 	// supply = 1000 - 200 = 800; 1 swap.

@@ -11,6 +11,8 @@ func TestClassify(t *testing.T) {
 		"ClearIOU":          iouKind,
 		"CurveStableSwapNG": curveKind,
 		"Pool":              curveKind,
+		"ClearOracle":       oracleKind,
+		"PythOracleAdapter": oracleKind,
 		"ERC20":             unknownKind,
 	}
 	for name, want := range cases {

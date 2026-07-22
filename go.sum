@@ -1,4 +1,4 @@
-github.com/evmi-cloud/go-evm-indexer v0.0.0-20260711141338-50a6e278ec70 h1:dQS8Btokzc2TY2SwXR5qb/y/hT8sNFKuzoRQrMQqYoY=
-github.com/evmi-cloud/go-evm-indexer v0.0.0-20260711141338-50a6e278ec70/go.mod h1:yet6shmLGuHZUi38+kau2bB1OD7oNTrJQyvg7342dFw=
+github.com/evmi-cloud/go-evm-indexer v0.0.0-20260722101628-ae612b27f528 h1:c3DVyyFa+Y60bGnQQEpgxnDcAw+bDDQrGufQAE32FvM=
+github.com/evmi-cloud/go-evm-indexer v0.0.0-20260722101628-ae612b27f528/go.mod h1:yet6shmLGuHZUi38+kau2bB1OD7oNTrJQyvg7342dFw=
 github.com/lib/pq v1.12.3 h1:tTWxr2YLKwIvK90ZXEw8GP7UFHtcbTtty8zsI+YjrfQ=
 github.com/lib/pq v1.12.3/go.mod h1:/p+8NSbOcwzAEI7wiMXFlgydTwcgTr3OSKMsD2BitpA=

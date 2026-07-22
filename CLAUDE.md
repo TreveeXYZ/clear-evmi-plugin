@@ -37,7 +37,7 @@ The whole pipeline is small (`main.go`, `schema.go`, `db.go`, `handlers.go`) but
    - **Balances & supplies are cumulative deltas** — ERC20 `Transfer` is decomposed into mint (from zero addr → +supply), burn (to zero addr → −supply), or transfer (−from/+to), and `adjustBalance` upserts `balance + delta`. These are correct *only* if indexing starts at/before the contract's first event; starting mid-history yields negative balances (documented limitation).
    - **History rows are idempotent inserts** — swaps, activity, curve liquidity all use `INSERT ... ON CONFLICT (id) DO NOTHING`, keyed by the event id. Safe to reapply.
 
-`dispatch()` in `main.go` is the single event→handler router; unhandled events (Approval, oracle/config updates) fall through and are ignored. Adding an event = add a `case` there + a handler in `handlers.go` + (usually) a column/table in `schema.go`.
+`dispatch()` in `main.go` is the single event→handler router; unhandled events (Approval, fee/config updates) fall through and are ignored. Adding an event = add a `case` there + a handler in `handlers.go` + (usually) a column/table in `schema.go`.
 
 ## Conventions that matter
 
@@ -55,3 +55,11 @@ Two things make it work: (1) the `Deposit`/`Withdraw` `amounts` array is aligned
 The plugin does **not** reconstruct meta-reserve token holdings or the underlying tokens' own ERC20 `Transfer`s (those aren't reserve events).
 
 `clear_reserve_assets.iou_supply` mirrors each asset's IOU `total_supply`: the IOU `Transfer` mint/burn path in `handleTransfer` updates both `clear_iou_tokens` (keyed by IOU address) and the registry row (`WHERE iou = <addr>`) in lockstep, so per-asset IOU supply is available without a join.
+
+## Oracle state
+
+`clear_oracle_prices` is **one row per asset** (PK = `asset`), folding events from two contracts (both classify as `oracleKind` — name contains "oracle"):
+- **ClearOracle** — `OracleConfigured` (enabled, asset/oracle decimals, `price_ttl`, `redemption_price`, and sets `oracle` = the ClearOracle address), `ClearOracleRateChanged` (`price`), `ClearOracleRedemptionPriceChanged` (`redemption_price`).
+- **PythOracleAdapter** — `PriceUpdated` (`price`).
+
+`last_refresh` is the **last refresh date**: every oracle handler stamps it with `log.BlockTimestamp` (block-header unix seconds — needs an EVMI server new enough to populate that field; see the pinned module version in `go.mod`), and `last_block` gets the same event's block number. The refresh cycle emits `ClearOracleRateChanged` (inside `updateCustomOraclePrice`) *and* the adapter's `PriceUpdated` in the same tx; both fold into the asset's row. Each handler upserts only its own columns (`INSERT … ON CONFLICT (asset) DO UPDATE`) so the row is created or patched in any order — except `handleOraclePublish` deliberately does **not** touch `oracle` (its `log.Address` is the adapter, not the ClearOracle). `parseBool` in `handlers.go` decodes the indexed `enabled` arg across the string forms evmi may emit.

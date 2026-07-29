@@ -35,7 +35,7 @@ const (
 )
 
 var allTables = []string{
-	"clear_processed_events", "clear_reserves", "clear_reserve_lp_balances",
+	"clear_processed_events", "clear_contracts", "clear_reserves", "clear_reserve_lp_balances",
 	"clear_reserve_assets", "clear_reserve_token_balances", "clear_reserve_swaps",
 	"clear_reserve_activity", "clear_reserve_value_history", "clear_iou_tokens",
 	"clear_iou_balances", "clear_oracle_prices", "clear_oracle_price_history",
@@ -97,14 +97,6 @@ func TestReplayProtocol(t *testing.T) {
 	}
 	raw.Close()
 
-	e := &clearExporter{}
-	cfg, _ := json.Marshal(pluginConfig{Dsn: dsn})
-	if err := e.Init(exporter.Context{ExporterName: "clear-defi-test", PipelineId: 1, ChainId: 1, Config: cfg}); err != nil {
-		t.Fatalf("init: %v", err)
-	}
-	defer e.Close()
-	db := e.db
-
 	const R = "ClearBaseReserve"
 	const IOU = "ClearIOU"
 	const CURVE = "CurveStableSwapNG"
@@ -112,6 +104,29 @@ func TestReplayProtocol(t *testing.T) {
 	const ADAPTER = "PythOracleAdapter"
 	const oracleAddr = "0x0000000000000000000000000000000000rac1e"
 	const adapterAddr = "0x00000000000000000000000000000000adap7e0"
+
+	e := &clearExporter{}
+	// Seed the address->kind registry from config (the reserve, pool and both
+	// oracle contracts). IOU tokens are discovered dynamically at AssetAdded.
+	cfg, _ := json.Marshal(pluginConfig{
+		Dsn: dsn,
+		Contracts: []contractConfig{
+			{Address: reserve, Kind: "base_reserve"},
+			{Address: pool, Kind: "curve"},
+			{Address: oracleAddr, Kind: "oracle"},
+			{Address: adapterAddr, Kind: "oracle"},
+		},
+	})
+	if err := e.Init(exporter.Context{ExporterName: "clear-defi-test", PipelineId: 1, ChainId: 1, Config: cfg}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer e.Close()
+	db := e.db
+
+	// Config contracts are recorded in the registry per chain on Init.
+	eq(t, db, "reserve contract", `SELECT count(*) FROM clear_contracts WHERE chain_id=1 AND address=$1 AND kind='base_reserve' AND source='config'`, normAddr(reserve))
+	eq(t, db, "curve contract", `SELECT count(*) FROM clear_contracts WHERE chain_id=1 AND address=$1 AND kind='curve' AND source='config'`, normAddr(pool))
+	eq(t, db, "oracle contract", `SELECT count(*) FROM clear_contracts WHERE chain_id=1 AND address=$1 AND kind='oracle' AND source='config'`, normAddr(oracleAddr))
 
 	// A realistic session. Amounts chosen so balances/supply are easy to verify.
 	// The reserve holds two assets (usdc pos 0, usdt pos 1); Deposit/Withdraw carry
@@ -213,6 +228,9 @@ func TestReplayProtocol(t *testing.T) {
 	eq(t, db, "asset usdt", `SELECT count(*) FROM clear_reserve_assets WHERE reserve=$1 AND asset=$2 AND iou=$3 AND decimals=6 AND position=1 AND iou_supply=0`, reserve, usdt, iou2)
 	eq(t, db, "iou supply", `SELECT count(*) FROM clear_iou_tokens WHERE address=$1 AND total_supply=5`, iou1)
 	eq(t, db, "carol iou", `SELECT count(*) FROM clear_iou_balances WHERE token=$1 AND holder=$2 AND balance=5`, iou1, carol)
+	// IOU tokens are discovered dynamically at AssetAdded and tracked in the registry.
+	eq(t, db, "iou1 tracked (dynamic)", `SELECT count(*) FROM clear_contracts WHERE chain_id=1 AND address=$1 AND kind='iou' AND source='dynamic'`, iou1)
+	eq(t, db, "iou2 tracked (dynamic)", `SELECT count(*) FROM clear_contracts WHERE chain_id=1 AND address=$1 AND kind='iou' AND source='dynamic'`, iou2)
 
 	// swap history.
 	eq(t, db, "reserve swap", `SELECT count(*) FROM clear_reserve_swaps WHERE reserve=$1 AND trader=$2 AND amount_in=100 AND amount_out=95 AND iou_total=5`, reserve, carol)

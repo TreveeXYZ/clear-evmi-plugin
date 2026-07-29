@@ -105,28 +105,29 @@ func jsonArg(args map[string]string, key string) sql.NullString {
 }
 
 // adjustBalance upserts a per-holder balance by delta (a signed decimal string).
-// keyCol is the owning-contract column (reserve / token / pool).
-func adjustBalance(tx *sql.Tx, table, keyCol, owner, holder, delta string, block uint64) error {
-	q := fmt.Sprintf(`INSERT INTO %s (%s, holder, balance, last_block)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (%s, holder) DO UPDATE
+// keyCol is the owning-contract column (reserve / token / pool). chainID scopes the
+// row so the same address on two chains stays distinct.
+func adjustBalance(tx *sql.Tx, chainID uint64, table, keyCol, owner, holder, delta string, block uint64) error {
+	q := fmt.Sprintf(`INSERT INTO %s (chain_id, %s, holder, balance, last_block)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (chain_id, %s, holder) DO UPDATE
 SET balance = %s.balance + EXCLUDED.balance, last_block = EXCLUDED.last_block`,
 		table, keyCol, keyCol, table)
-	_, err := tx.Exec(q, owner, holder, delta, block)
+	_, err := tx.Exec(q, chainID, owner, holder, delta, block)
 	return err
 }
 
 // adjustTokenBalance upserts a base reserve's physical holding of one underlying
 // asset by a signed decimal delta. Additive like adjustBalance (so it stays exact
 // under the exactly-once ledger); a zero/empty delta or missing asset is a no-op.
-func adjustTokenBalance(tx *sql.Tx, reserve, asset, delta string, block uint64) error {
+func adjustTokenBalance(tx *sql.Tx, chainID uint64, reserve, asset, delta string, block uint64) error {
 	if asset == "" || delta == "" || delta == "0" || delta == "-0" {
 		return nil
 	}
-	_, err := tx.Exec(`INSERT INTO clear_reserve_token_balances (reserve, asset, balance, last_block)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (reserve, asset) DO UPDATE
+	_, err := tx.Exec(`INSERT INTO clear_reserve_token_balances (chain_id, reserve, asset, balance, last_block)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (chain_id, reserve, asset) DO UPDATE
 SET balance = clear_reserve_token_balances.balance + EXCLUDED.balance, last_block = EXCLUDED.last_block`,
-		reserve, asset, delta, block)
+		chainID, reserve, asset, delta, block)
 	return err
 }

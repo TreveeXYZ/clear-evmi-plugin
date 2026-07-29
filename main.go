@@ -14,19 +14,24 @@
 // balances are exact only if indexing starts at or before each contract's first
 // event. Delivery is at-least-once; a processed-event ledger makes it exactly-once.
 //
+// Routing is BY ADDRESS. On Init the plugin loads a contract registry
+// (address -> kind) from pluginConfig.contracts and from the clear_contracts
+// table; each log is routed to a per-contract dispatcher by looking its address up
+// in that registry, instead of re-classifying the ABI name on every event. New
+// contracts (a factory-spawned IOU at AssetAdded, or any address seen for the
+// first time) are registered dynamically and persisted, so the registry grows as
+// the protocol does and is restored on restart. See registry.go / dispatch.go.
+//
 // Build (with the SAME toolchain/module versions as the evmi server):
 //
 //	go build -buildmode=plugin -o clear-defi.so ./examples/exporters/clear-defi
-//
-// Contract classification is by ABI ContractName (case-insensitive substring):
-// name the source ABIs so they contain Base/Meta + Reserve, IOU, or Curve /
-// StableSwap / Pool.
 package main
 
 import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	exporter "github.com/evmi-cloud/go-evm-indexer/pkg/exporter"
 	_ "github.com/lib/pq"
@@ -37,11 +42,28 @@ type pluginConfig struct {
 	Dsn string `json:"dsn"`
 	// AutoMigrate creates the tables on start (default true).
 	AutoMigrate *bool `json:"autoMigrate"`
+	// Contracts is the initial list of contracts to track, loaded into the
+	// address->kind registry on Init. IOU tokens are usually discovered
+	// dynamically at AssetAdded, so they need not be listed here.
+	Contracts []contractConfig `json:"contracts"`
+}
+
+// contractConfig is one entry of pluginConfig.contracts: an address and its kind
+// (base_reserve | meta_reserve | iou | curve | oracle). See kindFromString.
+type contractConfig struct {
+	Address string `json:"address"`
+	Kind    string `json:"kind"`
 }
 
 type clearExporter struct {
-	name string
-	db   *sql.DB
+	name    string
+	db      *sql.DB
+	chainID uint64
+
+	// registry maps a normalized contract address to its kind for this chain. It
+	// is loaded on Init and extended at runtime as new contracts are discovered.
+	mu       sync.RWMutex
+	registry map[string]contractKind
 }
 
 func (e *clearExporter) Name() string { return "clear-defi" }
@@ -61,11 +83,16 @@ func (e *clearExporter) ConfigSchema() []exporter.ConfigField {
 			Description: "Create the schema on start",
 			Default:     "true",
 		},
+		// `contracts` is a JSON array of {address, kind} and can't be expressed as a
+		// scalar ConfigField; EVMI allows unknown extra keys, so it is decoded from
+		// the raw config JSON (see pluginConfig) rather than declared here.
 	}
 }
 
 func (e *clearExporter) Init(ctx exporter.Context) error {
 	e.name = ctx.ExporterName
+	e.chainID = ctx.ChainId
+	e.registry = map[string]contractKind{}
 
 	var cfg pluginConfig
 	if len(ctx.Config) > 0 {
@@ -93,20 +120,32 @@ func (e *clearExporter) Init(ctx exporter.Context) error {
 		}
 	}
 
-	fmt.Printf("[%s] init pipeline=%d chain=%d\n", e.name, ctx.PipelineId, ctx.ChainId)
+	// Seed the registry from config, then (re)load every tracked contract for this
+	// chain — including any discovered dynamically on previous runs.
+	if err := e.seedContracts(cfg.Contracts); err != nil {
+		return fmt.Errorf("seed contracts: %w", err)
+	}
+	if err := e.loadRegistry(); err != nil {
+		return fmt.Errorf("load registry: %w", err)
+	}
+
+	fmt.Printf("[%s] init pipeline=%d chain=%d contracts=%d\n", e.name, ctx.PipelineId, ctx.ChainId, len(e.registry))
 	return nil
 }
 
 // NewLogEvent processes one log inside a transaction. It first claims the event
 // id in the processed ledger; if the id is already present (a redelivery after a
-// restart) it does nothing, so balance arithmetic is applied exactly once.
+// restart) it does nothing, so balance arithmetic is applied exactly once. The
+// contract kind is resolved by address from the registry (discovering and
+// persisting a new contract on first sight) and the log is routed to its
+// per-contract dispatcher.
 func (e *clearExporter) NewLogEvent(log exporter.LogEvent) error {
 	tx, err := e.db.Begin()
 	if err != nil {
 		return err
 	}
 
-	res, err := tx.Exec(`INSERT INTO clear_processed_events (id) VALUES ($1) ON CONFLICT DO NOTHING`, log.Id)
+	res, err := tx.Exec(`INSERT INTO clear_processed_events (id, chain_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, log.Id, log.ChainId)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -115,7 +154,18 @@ func (e *clearExporter) NewLogEvent(log exporter.LogEvent) error {
 		return tx.Rollback() // already processed
 	}
 
-	if err := dispatch(tx, log); err != nil {
+	k, err := e.resolveKind(tx, log)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("resolve contract %s (%s): %w", log.Address, log.Id, err)
+	}
+	if k == unknownKind {
+		// Log from an untracked contract: nothing to materialize. The id stays
+		// claimed so we don't revisit it.
+		return tx.Commit()
+	}
+
+	if err := e.dispatch(tx, log, k); err != nil {
 		tx.Rollback()
 		return fmt.Errorf("event %s (%s): %w", log.EventName, log.Id, err)
 	}
@@ -125,64 +175,6 @@ func (e *clearExporter) NewLogEvent(log exporter.LogEvent) error {
 func (e *clearExporter) Close() error {
 	if e.db != nil {
 		return e.db.Close()
-	}
-	return nil
-}
-
-// dispatch routes one decoded log to its handler. Unhandled events (Approval,
-// config/oracle updates, …) are ignored.
-func dispatch(tx *sql.Tx, log exporter.LogEvent) error {
-	k := classify(log.ContractName)
-	switch log.EventName {
-	// ERC20 balances (reserve LP / IOU / curve LP), routed by contract kind.
-	case "Transfer":
-		return handleTransfer(tx, log, k)
-
-	// Reserve activity.
-	case "Deposit":
-		return handleReserveDeposit(tx, log, k)
-	case "Withdraw":
-		return handleReserveWithdraw(tx, log, k)
-	case "SingleAssetDeposit":
-		return handleSingleAssetDeposit(tx, log, k)
-	case "SingleAssetWithdraw":
-		return handleSingleAssetWithdraw(tx, log, k)
-	case "Rebalanced":
-		return handleRebalanced(tx, log, k)
-	case "Swap":
-		return handleReserveSwap(tx, log, k)
-	case "IOUMinted":
-		return handleIOUMinted(tx, log, k)
-	case "IOURedeemed":
-		return handleIOURedeemed(tx, log, k)
-	case "AssetAdded":
-		return handleAssetAdded(tx, log, k)
-	case "FlashLoan":
-		return handleFlashLoan(tx, log, k)
-
-	// Curve pool activity.
-	case "TokenExchange":
-		return handleCurveSwap(tx, log, false)
-	case "TokenExchangeUnderlying":
-		return handleCurveSwap(tx, log, true)
-	// Oracle state (per-asset config, price, redemption, refresh time).
-	case "OracleConfigured":
-		return handleOracleConfigured(tx, log)
-	case "ClearOracleRateChanged":
-		return handleOracleRate(tx, log)
-	case "ClearOracleRedemptionPriceChanged":
-		return handleOracleRedemption(tx, log)
-	case "PriceUpdated":
-		return handleOraclePublish(tx, log)
-
-	case "AddLiquidity":
-		return handleCurveLiquidity(tx, log, "add")
-	case "RemoveLiquidity":
-		return handleCurveLiquidity(tx, log, "remove")
-	case "RemoveLiquidityOne":
-		return handleCurveLiquidity(tx, log, "remove_one")
-	case "RemoveLiquidityImbalance":
-		return handleCurveLiquidity(tx, log, "remove_imbalance")
 	}
 	return nil
 }

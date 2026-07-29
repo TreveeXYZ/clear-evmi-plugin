@@ -51,10 +51,6 @@
       {
         "contractName": "ClearOracle",
         "content": "[{\"type\":\"event\",\"name\":\"OracleConfigured\",\"anonymous\":false,\"inputs\":[{\"name\":\"enabled\",\"type\":\"bool\",\"indexed\":true},{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"assetDecimals\",\"type\":\"uint8\",\"indexed\":false},{\"name\":\"oracleDecimals\",\"type\":\"uint8\",\"indexed\":false},{\"name\":\"priceTTL\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"redemptionPrice\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"ClearOracleRateChanged\",\"anonymous\":false,\"inputs\":[{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"price\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"ClearOracleRedemptionPriceChanged\",\"anonymous\":false,\"inputs\":[{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"redemptionPrice\",\"type\":\"uint256\",\"indexed\":false}]}]"
-      },
-      {
-        "contractName": "PythOracleAdapter",
-        "content": "[{\"type\":\"event\",\"name\":\"PriceUpdated\",\"anonymous\":false,\"inputs\":[{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"price\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"publishTime\",\"type\":\"uint256\",\"indexed\":false}]}]"
       }
     ],
     "stores": [
@@ -134,7 +130,15 @@
         "startBlock": 0,
         "pluginConfig": {
           "dsn": "postgres://evmi:secret@postgres:5432/clear?sslmode=disable",
-          "autoMigrate": true
+          "autoMigrate": true,
+          "_comment_contracts": "Address->kind registry seeded on Init. kind: base_reserve|meta_reserve|iou|curve|oracle. IOUs are discovered dynamically at AssetAdded, so they need not be listed. Match these to the source addresses above.",
+          "contracts": [
+            { "address": "0x0000000000000000000000000000000000000001", "kind": "base_reserve" },
+            { "address": "0x0000000000000000000000000000000000000002", "kind": "meta_reserve" },
+            { "address": "0x0000000000000000000000000000000000000003", "kind": "curve" },
+            { "address": "0x0000000000000000000000000000000000000004", "kind": "oracle" },
+            { "address": "0x0000000000000000000000000000000000000005", "kind": "oracle" }
+          ]
         }
       }
     ]

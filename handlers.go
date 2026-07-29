@@ -11,27 +11,27 @@ import (
 
 // --- registry upserts ---
 
-func ensureReserve(tx *sql.Tx, addr, kind string, block uint64) error {
-	_, err := tx.Exec(`INSERT INTO clear_reserves (address, kind, first_block, last_block)
+func ensureReserve(tx *sql.Tx, chainID uint64, addr, kind string, block uint64) error {
+	_, err := tx.Exec(`INSERT INTO clear_reserves (chain_id, address, kind, first_block, last_block)
+VALUES ($1, $2, $3, $4, $4)
+ON CONFLICT (chain_id, address) DO UPDATE SET last_block = GREATEST(clear_reserves.last_block, EXCLUDED.last_block)`,
+		chainID, addr, kind, block)
+	return err
+}
+
+func ensureCurve(tx *sql.Tx, chainID uint64, addr string, block uint64) error {
+	_, err := tx.Exec(`INSERT INTO clear_curve_pools (chain_id, address, first_block, last_block)
 VALUES ($1, $2, $3, $3)
-ON CONFLICT (address) DO UPDATE SET last_block = GREATEST(clear_reserves.last_block, EXCLUDED.last_block)`,
-		addr, kind, block)
+ON CONFLICT (chain_id, address) DO UPDATE SET last_block = GREATEST(clear_curve_pools.last_block, EXCLUDED.last_block)`,
+		chainID, addr, block)
 	return err
 }
 
-func ensureCurve(tx *sql.Tx, addr string, block uint64) error {
-	_, err := tx.Exec(`INSERT INTO clear_curve_pools (address, first_block, last_block)
-VALUES ($1, $2, $2)
-ON CONFLICT (address) DO UPDATE SET last_block = GREATEST(clear_curve_pools.last_block, EXCLUDED.last_block)`,
-		addr, block)
-	return err
-}
-
-func ensureIou(tx *sql.Tx, addr string, block uint64) error {
-	_, err := tx.Exec(`INSERT INTO clear_iou_tokens (address, last_block)
-VALUES ($1, $2)
-ON CONFLICT (address) DO UPDATE SET last_block = GREATEST(clear_iou_tokens.last_block, EXCLUDED.last_block)`,
-		addr, block)
+func ensureIou(tx *sql.Tx, chainID uint64, addr string, block uint64) error {
+	_, err := tx.Exec(`INSERT INTO clear_iou_tokens (chain_id, address, last_block)
+VALUES ($1, $2, $3)
+ON CONFLICT (chain_id, address) DO UPDATE SET last_block = GREATEST(clear_iou_tokens.last_block, EXCLUDED.last_block)`,
+		chainID, addr, block)
 	return err
 }
 
@@ -59,21 +59,22 @@ func handleTransfer(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	}
 	owner := normAddr(log.Address)
 	block := log.BlockNumber
+	chainID := log.ChainId
 
 	var balTable, keyCol, parentTable string
 	switch k {
 	case baseReserveKind, metaReserveKind:
-		if err := ensureReserve(tx, owner, k.reserveType(), block); err != nil {
+		if err := ensureReserve(tx, chainID, owner, k.reserveType(), block); err != nil {
 			return err
 		}
 		balTable, keyCol, parentTable = "clear_reserve_lp_balances", "reserve", "clear_reserves"
 	case iouKind:
-		if err := ensureIou(tx, owner, block); err != nil {
+		if err := ensureIou(tx, chainID, owner, block); err != nil {
 			return err
 		}
 		balTable, keyCol, parentTable = "clear_iou_balances", "token", "clear_iou_tokens"
 	case curveKind:
-		if err := ensureCurve(tx, owner, block); err != nil {
+		if err := ensureCurve(tx, chainID, owner, block); err != nil {
 			return err
 		}
 		balTable, keyCol, parentTable = "clear_curve_lp_balances", "pool", "clear_curve_pools"
@@ -86,33 +87,33 @@ func handleTransfer(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 		supplyCol = "total_supply"
 	}
 	addSupply := func(delta string) error {
-		if err := exec(tx, "UPDATE "+parentTable+" SET "+supplyCol+" = "+supplyCol+" + $2, last_block = $3 WHERE address = $1",
-			owner, delta, block); err != nil {
+		if err := exec(tx, "UPDATE "+parentTable+" SET "+supplyCol+" = "+supplyCol+" + $3, last_block = $4 WHERE chain_id = $1 AND address = $2",
+			chainID, owner, delta, block); err != nil {
 			return err
 		}
 		// Mirror IOU supply onto its reserve-asset registry row (1 IOU per asset).
 		if k == iouKind {
-			return exec(tx, "UPDATE clear_reserve_assets SET iou_supply = iou_supply + $2 WHERE iou = $1", owner, delta)
+			return exec(tx, "UPDATE clear_reserve_assets SET iou_supply = iou_supply + $3 WHERE chain_id = $1 AND iou = $2", chainID, owner, delta)
 		}
 		return nil
 	}
 
 	switch {
 	case isZeroAddr(from): // mint
-		if err := adjustBalance(tx, balTable, keyCol, owner, to, val, block); err != nil {
+		if err := adjustBalance(tx, chainID, balTable, keyCol, owner, to, val, block); err != nil {
 			return err
 		}
 		return addSupply(val)
 	case isZeroAddr(to): // burn
-		if err := adjustBalance(tx, balTable, keyCol, owner, from, neg(val), block); err != nil {
+		if err := adjustBalance(tx, chainID, balTable, keyCol, owner, from, neg(val), block); err != nil {
 			return err
 		}
 		return addSupply(neg(val))
 	default: // transfer
-		if err := adjustBalance(tx, balTable, keyCol, owner, from, neg(val), block); err != nil {
+		if err := adjustBalance(tx, chainID, balTable, keyCol, owner, from, neg(val), block); err != nil {
 			return err
 		}
-		return adjustBalance(tx, balTable, keyCol, owner, to, val, block)
+		return adjustBalance(tx, chainID, balTable, keyCol, owner, to, val, block)
 	}
 }
 
@@ -125,8 +126,8 @@ func handleTransfer(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 
 // reserveAssetsByPosition returns the reserve's assets keyed by their assetList
 // index, so a Deposit/Withdraw `amounts[i]` can be routed to the right token.
-func reserveAssetsByPosition(tx *sql.Tx, reserve string) (map[int]string, error) {
-	rows, err := tx.Query(`SELECT position, asset FROM clear_reserve_assets WHERE reserve = $1 AND position IS NOT NULL`, reserve)
+func reserveAssetsByPosition(tx *sql.Tx, chainID uint64, reserve string) (map[int]string, error) {
+	rows, err := tx.Query(`SELECT position, asset FROM clear_reserve_assets WHERE chain_id = $1 AND reserve = $2 AND position IS NOT NULL`, chainID, reserve)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +149,7 @@ func reserveAssetsByPosition(tx *sql.Tx, reserve string) (map[int]string, error)
 // aligned with assetList order. `negate` flips the sign for withdrawals. An index
 // whose asset is unknown (AssetAdded missed because indexing started late) is
 // skipped — its balance would be wrong anyway.
-func applyReserveAmounts(tx *sql.Tx, reserve, amountsJSON string, negate bool, block uint64) error {
+func applyReserveAmounts(tx *sql.Tx, chainID uint64, reserve, amountsJSON string, negate bool, block uint64) error {
 	if amountsJSON == "" {
 		return nil
 	}
@@ -156,7 +157,7 @@ func applyReserveAmounts(tx *sql.Tx, reserve, amountsJSON string, negate bool, b
 	if err := json.Unmarshal([]byte(amountsJSON), &amounts); err != nil {
 		return fmt.Errorf("amounts array %q: %w", amountsJSON, err)
 	}
-	byPos, err := reserveAssetsByPosition(tx, reserve)
+	byPos, err := reserveAssetsByPosition(tx, chainID, reserve)
 	if err != nil {
 		return err
 	}
@@ -169,7 +170,7 @@ func applyReserveAmounts(tx *sql.Tx, reserve, amountsJSON string, negate bool, b
 		if negate {
 			delta = neg(amt)
 		}
-		if err := adjustTokenBalance(tx, reserve, asset, delta, block); err != nil {
+		if err := adjustTokenBalance(tx, chainID, reserve, asset, delta, block); err != nil {
 			return err
 		}
 	}
@@ -184,20 +185,20 @@ func applyReserveAmounts(tx *sql.Tx, reserve, amountsJSON string, negate bool, b
 // only. Call it after this event's balances/supply are applied.
 func snapshotReserveValue(tx *sql.Tx, reserve string, log exporter.LogEvent) error {
 	_, err := tx.Exec(`INSERT INTO clear_reserve_value_history
-(reserve, day, block_number, block_timestamp, total_assets, total_supply)
-SELECT $1, (to_timestamp($2) AT TIME ZONE 'UTC')::date, $3, $2,
+(chain_id, reserve, day, block_number, block_timestamp, total_assets, total_supply)
+SELECT $4, $1, (to_timestamp($2) AT TIME ZONE 'UTC')::date, $3, $2,
   COALESCE((SELECT sum(b.balance * power(10::numeric, 18 - COALESCE(a.decimals, 18)))
             FROM clear_reserve_token_balances b
-            JOIN clear_reserve_assets a ON a.reserve = b.reserve AND a.asset = b.asset
-            WHERE b.reserve = $1), 0),
-  COALESCE((SELECT lp_supply FROM clear_reserves WHERE address = $1), 0)
-ON CONFLICT (reserve, day) DO UPDATE SET
+            JOIN clear_reserve_assets a ON a.chain_id = b.chain_id AND a.reserve = b.reserve AND a.asset = b.asset
+            WHERE b.chain_id = $4 AND b.reserve = $1), 0),
+  COALESCE((SELECT lp_supply FROM clear_reserves WHERE chain_id = $4 AND address = $1), 0)
+ON CONFLICT (chain_id, reserve, day) DO UPDATE SET
   block_number = EXCLUDED.block_number,
   block_timestamp = EXCLUDED.block_timestamp,
   total_assets = EXCLUDED.total_assets,
   total_supply = EXCLUDED.total_supply
 WHERE clear_reserve_value_history.block_number <= EXCLUDED.block_number`,
-		reserve, log.BlockTimestamp, log.BlockNumber)
+		reserve, log.BlockTimestamp, log.BlockNumber, log.ChainId)
 	return err
 }
 
@@ -205,10 +206,10 @@ WHERE clear_reserve_value_history.block_number <= EXCLUDED.block_number`,
 
 func insertActivity(tx *sql.Tx, log exporter.LogEvent, reserve, action, caller, receiver, asset, amount, amount2, fee, lp string) error {
 	return exec(tx, `INSERT INTO clear_reserve_activity
-(id, reserve, block_number, log_index, tx_hash, action, caller, receiver, asset, amount, amount2, fee, lp)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+(id, chain_id, reserve, block_number, log_index, tx_hash, action, caller, receiver, asset, amount, amount2, fee, lp)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 ON CONFLICT (id) DO NOTHING`,
-		log.Id, reserve, log.BlockNumber, log.LogIndex, log.TransactionHash, action,
+		log.Id, log.ChainId, reserve, log.BlockNumber, log.LogIndex, log.TransactionHash, action,
 		caller, receiver, nullEmpty(asset), amount, amount2, fee, lp)
 }
 
@@ -219,12 +220,12 @@ func nullEmpty(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: true}
 }
 
-func bumpReserve(tx *sql.Tx, reserve, kind, col, delta string, block uint64) error {
-	if err := ensureReserve(tx, reserve, kind, block); err != nil {
+func bumpReserve(tx *sql.Tx, chainID uint64, reserve, kind, col, delta string, block uint64) error {
+	if err := ensureReserve(tx, chainID, reserve, kind, block); err != nil {
 		return err
 	}
-	return exec(tx, "UPDATE clear_reserves SET "+col+" = "+col+" + $2, last_block = $3 WHERE address = $1",
-		reserve, delta, block)
+	return exec(tx, "UPDATE clear_reserves SET "+col+" = "+col+" + $3, last_block = $4 WHERE chain_id = $1 AND address = $2",
+		chainID, reserve, delta, block)
 }
 
 func handleReserveDeposit(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
@@ -237,14 +238,14 @@ func handleReserveDeposit(tx *sql.Tx, log exporter.LogEvent, k contractKind) err
 		return err
 	}
 	if k == baseReserveKind {
-		if err := applyReserveAmounts(tx, reserve, a["amounts"], false, log.BlockNumber); err != nil {
+		if err := applyReserveAmounts(tx, log.ChainId, reserve, a["amounts"], false, log.BlockNumber); err != nil {
 			return err
 		}
 		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
-	return bumpReserve(tx, reserve, k.reserveType(), "total_deposits", numOrZero(lp), log.BlockNumber)
+	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "total_deposits", numOrZero(lp), log.BlockNumber)
 }
 
 func handleReserveWithdraw(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
@@ -257,14 +258,14 @@ func handleReserveWithdraw(tx *sql.Tx, log exporter.LogEvent, k contractKind) er
 		return err
 	}
 	if k == baseReserveKind {
-		if err := applyReserveAmounts(tx, reserve, a["amounts"], true, log.BlockNumber); err != nil {
+		if err := applyReserveAmounts(tx, log.ChainId, reserve, a["amounts"], true, log.BlockNumber); err != nil {
 			return err
 		}
 		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
-	return bumpReserve(tx, reserve, k.reserveType(), "total_withdrawals", numOrZero(lp), log.BlockNumber)
+	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "total_withdrawals", numOrZero(lp), log.BlockNumber)
 }
 
 func handleSingleAssetDeposit(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
@@ -279,17 +280,17 @@ func handleSingleAssetDeposit(tx *sql.Tx, log exporter.LogEvent, k contractKind)
 	if k == baseReserveKind {
 		// amountIn pulled in; fee forwarded to treasury — net (amountIn - fee) stays.
 		asset := normAddr(a["asset"])
-		if err := adjustTokenBalance(tx, reserve, asset, num(a, "amountIn"), log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, num(a, "amountIn"), log.BlockNumber); err != nil {
 			return err
 		}
-		if err := adjustTokenBalance(tx, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
 			return err
 		}
 		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
-	return bumpReserve(tx, reserve, k.reserveType(), "total_deposits", numOrZero(lp), log.BlockNumber)
+	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "total_deposits", numOrZero(lp), log.BlockNumber)
 }
 
 func handleSingleAssetWithdraw(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
@@ -304,30 +305,30 @@ func handleSingleAssetWithdraw(tx *sql.Tx, log exporter.LogEvent, k contractKind
 	if k == baseReserveKind {
 		// amountOut sent to receiver and fee to treasury both leave the reserve.
 		asset := normAddr(a["asset"])
-		if err := adjustTokenBalance(tx, reserve, asset, neg(num(a, "amountOut")), log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, neg(num(a, "amountOut")), log.BlockNumber); err != nil {
 			return err
 		}
-		if err := adjustTokenBalance(tx, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
 			return err
 		}
 		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
-	return bumpReserve(tx, reserve, k.reserveType(), "total_withdrawals", numOrZero(lp), log.BlockNumber)
+	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "total_withdrawals", numOrZero(lp), log.BlockNumber)
 }
 
 func handleRebalanced(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	a := log.Args
 	reserve := normAddr(log.Address)
-	if err := ensureReserve(tx, reserve, k.reserveType(), log.BlockNumber); err != nil {
+	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
 	}
 	if k == baseReserveKind {
-		if err := adjustTokenBalance(tx, reserve, normAddr(a["tokenIn"]), num(a, "amountIn"), log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenIn"]), num(a, "amountIn"), log.BlockNumber); err != nil {
 			return err
 		}
-		if err := adjustTokenBalance(tx, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
 			return err
 		}
 		if err := snapshotReserveValue(tx, reserve, log); err != nil {
@@ -342,12 +343,12 @@ func handleRebalanced(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 func handleFlashLoan(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	a := log.Args
 	reserve := normAddr(log.Address)
-	if err := ensureReserve(tx, reserve, k.reserveType(), log.BlockNumber); err != nil {
+	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
 	}
 	if k == baseReserveKind {
 		// Principal is lent and returned within the tx; only the fee stays in the reserve.
-		if err := adjustTokenBalance(tx, reserve, normAddr(a["token"]), num(a, "fee"), log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["token"]), num(a, "fee"), log.BlockNumber); err != nil {
 			return err
 		}
 		if err := snapshotReserveValue(tx, reserve, log); err != nil {
@@ -370,14 +371,14 @@ func handleIOUMinted(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	}
 	if k == baseReserveKind {
 		// mintIOU pulls `amount` of the underlying into the reserve (1:1 backing).
-		if err := adjustTokenBalance(tx, reserve, normAddr(a["asset"]), amount, log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["asset"]), amount, log.BlockNumber); err != nil {
 			return err
 		}
 		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
-	return bumpReserve(tx, reserve, k.reserveType(), "iou_minted", amount, log.BlockNumber)
+	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "iou_minted", amount, log.BlockNumber)
 }
 
 func handleIOURedeemed(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
@@ -391,28 +392,28 @@ func handleIOURedeemed(tx *sql.Tx, log exporter.LogEvent, k contractKind) error 
 	}
 	if k == baseReserveKind {
 		// redeemIOU pays out `amount` of the underlying (par settlement, 1:1).
-		if err := adjustTokenBalance(tx, reserve, normAddr(a["asset"]), neg(amount), log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["asset"]), neg(amount), log.BlockNumber); err != nil {
 			return err
 		}
 		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
-	return bumpReserve(tx, reserve, k.reserveType(), "iou_redeemed", amount, log.BlockNumber)
+	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "iou_redeemed", amount, log.BlockNumber)
 }
 
 func handleReserveSwap(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	a := log.Args
 	reserve := normAddr(log.Address)
-	if err := ensureReserve(tx, reserve, k.reserveType(), log.BlockNumber); err != nil {
+	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
 	}
 	if err := exec(tx, `INSERT INTO clear_reserve_swaps
-(id, reserve, block_number, log_index, tx_hash, trader, token_in, token_out, recipient,
+(id, chain_id, reserve, block_number, log_index, tx_hash, trader, token_in, token_out, recipient,
  amount_in, amount_out, iou_total, trader_iou, treasury_iou, lp_iou)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 ON CONFLICT (id) DO NOTHING`,
-		log.Id, reserve, log.BlockNumber, log.LogIndex, log.TransactionHash,
+		log.Id, log.ChainId, reserve, log.BlockNumber, log.LogIndex, log.TransactionHash,
 		normAddr(a["trader"]), normAddr(a["tokenIn"]), normAddr(a["tokenOut"]), normAddr(a["recipient"]),
 		num(a, "amountIn"), num(a, "amountOut"), num(a, "iouTotal"), num(a, "traderIOU"), num(a, "treasuryIOU"), num(a, "lpIOU")); err != nil {
 		return err
@@ -420,38 +421,38 @@ ON CONFLICT (id) DO NOTHING`,
 	if k == baseReserveKind {
 		// amountIn of tokenIn received, amountOut of tokenOut paid out. The IOU
 		// shortfall is a claim minted against NAV, not an underlying-token movement.
-		if err := adjustTokenBalance(tx, reserve, normAddr(a["tokenIn"]), num(a, "amountIn"), log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenIn"]), num(a, "amountIn"), log.BlockNumber); err != nil {
 			return err
 		}
-		if err := adjustTokenBalance(tx, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
+		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
 			return err
 		}
 		if err := snapshotReserveValue(tx, reserve, log); err != nil {
 			return err
 		}
 	}
-	return exec(tx, `UPDATE clear_reserves SET swap_count = swap_count + 1, last_block = $2 WHERE address = $1`,
-		reserve, log.BlockNumber)
+	return exec(tx, `UPDATE clear_reserves SET swap_count = swap_count + 1, last_block = $3 WHERE chain_id = $1 AND address = $2`,
+		log.ChainId, reserve, log.BlockNumber)
 }
 
 func handleAssetAdded(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	a := log.Args
 	reserve := normAddr(log.Address)
 	iou := normAddr(a["iou"])
-	if err := ensureReserve(tx, reserve, k.reserveType(), log.BlockNumber); err != nil {
+	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
 	}
 	if iou != "" && !isZeroAddr(iou) {
-		if err := ensureIou(tx, iou, log.BlockNumber); err != nil {
+		if err := ensureIou(tx, log.ChainId, iou, log.BlockNumber); err != nil {
 			return err
 		}
 	}
 	// position = current asset count for the reserve, so it mirrors the contract's
 	// append-only assetList index; kept unchanged on a re-emit (assets are added once).
-	return exec(tx, `INSERT INTO clear_reserve_assets (reserve, asset, decimals, iou, position)
-VALUES ($1, $2, $3, $4, (SELECT count(*) FROM clear_reserve_assets WHERE reserve = $1))
-ON CONFLICT (reserve, asset) DO UPDATE SET decimals = EXCLUDED.decimals, iou = EXCLUDED.iou`,
-		reserve, normAddr(a["asset"]), nullNum(a, "decimals"), nullEmpty(iou))
+	return exec(tx, `INSERT INTO clear_reserve_assets (chain_id, reserve, asset, decimals, iou, position)
+VALUES ($1, $2, $3, $4, $5, (SELECT count(*) FROM clear_reserve_assets WHERE chain_id = $1 AND reserve = $2))
+ON CONFLICT (chain_id, reserve, asset) DO UPDATE SET decimals = EXCLUDED.decimals, iou = EXCLUDED.iou`,
+		log.ChainId, reserve, normAddr(a["asset"]), nullNum(a, "decimals"), nullEmpty(iou))
 }
 
 // --- curve pool events ---
@@ -459,34 +460,34 @@ ON CONFLICT (reserve, asset) DO UPDATE SET decimals = EXCLUDED.decimals, iou = E
 func handleCurveSwap(tx *sql.Tx, log exporter.LogEvent, underlying bool) error {
 	a := log.Args
 	pool := normAddr(log.Address)
-	if err := ensureCurve(tx, pool, log.BlockNumber); err != nil {
+	if err := ensureCurve(tx, log.ChainId, pool, log.BlockNumber); err != nil {
 		return err
 	}
 	if err := exec(tx, `INSERT INTO clear_curve_swaps
-(id, pool, block_number, log_index, tx_hash, buyer, sold_id, tokens_sold, bought_id, tokens_bought, underlying)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+(id, chain_id, pool, block_number, log_index, tx_hash, buyer, sold_id, tokens_sold, bought_id, tokens_bought, underlying)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 ON CONFLICT (id) DO NOTHING`,
-		log.Id, pool, log.BlockNumber, log.LogIndex, log.TransactionHash,
+		log.Id, log.ChainId, pool, log.BlockNumber, log.LogIndex, log.TransactionHash,
 		normAddr(a["buyer"]), num(a, "sold_id"), num(a, "tokens_sold"),
 		num(a, "bought_id"), num(a, "tokens_bought"), underlying); err != nil {
 		return err
 	}
-	return exec(tx, `UPDATE clear_curve_pools SET swap_count = swap_count + 1, last_block = $2 WHERE address = $1`,
-		pool, log.BlockNumber)
+	return exec(tx, `UPDATE clear_curve_pools SET swap_count = swap_count + 1, last_block = $3 WHERE chain_id = $1 AND address = $2`,
+		log.ChainId, pool, log.BlockNumber)
 }
 
 func handleCurveLiquidity(tx *sql.Tx, log exporter.LogEvent, kind string) error {
 	a := log.Args
 	pool := normAddr(log.Address)
-	if err := ensureCurve(tx, pool, log.BlockNumber); err != nil {
+	if err := ensureCurve(tx, log.ChainId, pool, log.BlockNumber); err != nil {
 		return err
 	}
 	return exec(tx, `INSERT INTO clear_curve_liquidity
-(id, pool, block_number, log_index, tx_hash, provider, kind,
+(id, chain_id, pool, block_number, log_index, tx_hash, provider, kind,
  token_amounts, fees, token_id, token_amount, coin_amount, invariant, token_supply)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 ON CONFLICT (id) DO NOTHING`,
-		log.Id, pool, log.BlockNumber, log.LogIndex, log.TransactionHash,
+		log.Id, log.ChainId, pool, log.BlockNumber, log.LogIndex, log.TransactionHash,
 		normAddr(a["provider"]), kind,
 		jsonArg(a, "token_amounts"), jsonArg(a, "fees"),
 		nullNum(a, "token_id"), nullNum(a, "token_amount"), nullNum(a, "coin_amount"),
@@ -536,9 +537,9 @@ func handleOracleConfigured(tx *sql.Tx, log exporter.LogEvent) error {
 		return nil
 	}
 	return exec(tx, `INSERT INTO clear_oracle_prices
-(asset, oracle, enabled, asset_decimals, oracle_decimals, price_ttl, redemption_price, last_refresh, last_block)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-ON CONFLICT (asset) DO UPDATE SET
+(chain_id, asset, oracle, enabled, asset_decimals, oracle_decimals, price_ttl, redemption_price, last_refresh, last_block)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+ON CONFLICT (chain_id, asset) DO UPDATE SET
   oracle = EXCLUDED.oracle,
   enabled = EXCLUDED.enabled,
   asset_decimals = EXCLUDED.asset_decimals,
@@ -547,7 +548,7 @@ ON CONFLICT (asset) DO UPDATE SET
   redemption_price = EXCLUDED.redemption_price,
   last_refresh = EXCLUDED.last_refresh,
   last_block = EXCLUDED.last_block`,
-		asset, normAddr(log.Address), parseBool(a["enabled"]),
+		log.ChainId, asset, normAddr(log.Address), parseBool(a["enabled"]),
 		nullNum(a, "assetDecimals"), nullNum(a, "oracleDecimals"),
 		nullNum(a, "priceTTL"), nullNum(a, "redemptionPrice"), log.BlockTimestamp, log.BlockNumber)
 }
@@ -558,18 +559,18 @@ func handleOracleRate(tx *sql.Tx, log exporter.LogEvent) error {
 	if asset == "" {
 		return nil
 	}
-	if err := exec(tx, `INSERT INTO clear_oracle_prices (asset, oracle, price, last_refresh, last_block)
-VALUES ($1,$2,$3,$4,$5)
-ON CONFLICT (asset) DO UPDATE SET
+	if err := exec(tx, `INSERT INTO clear_oracle_prices (chain_id, asset, oracle, price, last_refresh, last_block)
+VALUES ($1,$2,$3,$4,$5,$6)
+ON CONFLICT (chain_id, asset) DO UPDATE SET
   oracle = EXCLUDED.oracle, price = EXCLUDED.price,
   last_refresh = EXCLUDED.last_refresh, last_block = EXCLUDED.last_block`,
-		asset, normAddr(log.Address), num(a, "price"), log.BlockTimestamp, log.BlockNumber); err != nil {
+		log.ChainId, asset, normAddr(log.Address), num(a, "price"), log.BlockTimestamp, log.BlockNumber); err != nil {
 		return err
 	}
 	// Append the price point for charting (every price write emits this event).
-	return exec(tx, `INSERT INTO clear_oracle_price_history (id, asset, block_number, block_timestamp, price)
-VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO NOTHING`,
-		log.Id, asset, log.BlockNumber, log.BlockTimestamp, num(a, "price"))
+	return exec(tx, `INSERT INTO clear_oracle_price_history (id, chain_id, asset, block_number, block_timestamp, price)
+VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING`,
+		log.Id, log.ChainId, asset, log.BlockNumber, log.BlockTimestamp, num(a, "price"))
 }
 
 func handleOracleRedemption(tx *sql.Tx, log exporter.LogEvent) error {
@@ -578,12 +579,12 @@ func handleOracleRedemption(tx *sql.Tx, log exporter.LogEvent) error {
 	if asset == "" {
 		return nil
 	}
-	return exec(tx, `INSERT INTO clear_oracle_prices (asset, redemption_price, last_refresh, last_block)
-VALUES ($1,$2,$3,$4)
-ON CONFLICT (asset) DO UPDATE SET
+	return exec(tx, `INSERT INTO clear_oracle_prices (chain_id, asset, redemption_price, last_refresh, last_block)
+VALUES ($1,$2,$3,$4,$5)
+ON CONFLICT (chain_id, asset) DO UPDATE SET
   redemption_price = EXCLUDED.redemption_price,
   last_refresh = EXCLUDED.last_refresh, last_block = EXCLUDED.last_block`,
-		asset, num(a, "redemptionPrice"), log.BlockTimestamp, log.BlockNumber)
+		log.ChainId, asset, num(a, "redemptionPrice"), log.BlockTimestamp, log.BlockNumber)
 }
 
 // handleOraclePublish records the adapter's price refresh. It does not overwrite
@@ -594,9 +595,9 @@ func handleOraclePublish(tx *sql.Tx, log exporter.LogEvent) error {
 	if asset == "" {
 		return nil
 	}
-	return exec(tx, `INSERT INTO clear_oracle_prices (asset, price, last_refresh, last_block)
-VALUES ($1,$2,$3,$4)
-ON CONFLICT (asset) DO UPDATE SET
+	return exec(tx, `INSERT INTO clear_oracle_prices (chain_id, asset, price, last_refresh, last_block)
+VALUES ($1,$2,$3,$4,$5)
+ON CONFLICT (chain_id, asset) DO UPDATE SET
   price = EXCLUDED.price, last_refresh = EXCLUDED.last_refresh, last_block = EXCLUDED.last_block`,
-		asset, num(a, "price"), log.BlockTimestamp, log.BlockNumber)
+		log.ChainId, asset, num(a, "price"), log.BlockTimestamp, log.BlockNumber)
 }

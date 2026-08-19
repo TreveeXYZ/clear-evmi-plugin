@@ -121,8 +121,13 @@ func handleTransfer(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 //
 // clear_reserve_token_balances reconstructs the reserve's real ERC20 holdings from
 // the token flows carried by its events. Only base reserves are tracked: their
-// assets come from AssetAdded (positioned in assetList order), whereas a meta
-// reserve holds base-LP + native, which are not in that registry.
+// assets come from AssetAdded positioned in assetList order, which is what makes a
+// Deposit/Withdraw `amounts[i]` resolvable to a token. A meta reserve also emits
+// AssetAdded (one per leg, since the "add some logs" contract change), so its legs
+// ARE registered — but its balanced Deposit/Withdraw carry named scalars
+// (baseLpIn/nativeIn, baseLpOut/nativeOut) instead of a positional amounts array,
+// with nothing in the event tying a scalar to a leg address. Its physical holdings
+// are therefore still not reconstructed.
 
 // reserveAssetsByPosition returns the reserve's assets keyed by their assetList
 // index, so a Deposit/Withdraw `amounts[i]` can be routed to the right token.
@@ -449,10 +454,16 @@ func handleAssetAdded(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	}
 	// position = current asset count for the reserve, so it mirrors the contract's
 	// append-only assetList index; kept unchanged on a re-emit (assets are added once).
-	return exec(tx, `INSERT INTO clear_reserve_assets (chain_id, reserve, asset, decimals, iou, position)
-VALUES ($1, $2, $3, $4, $5, (SELECT count(*) FROM clear_reserve_assets WHERE chain_id = $1 AND reserve = $2))
-ON CONFLICT (chain_id, reserve, asset) DO UPDATE SET decimals = EXCLUDED.decimals, iou = EXCLUDED.iou`,
-		log.ChainId, reserve, normAddr(a["asset"]), nullNum(a, "decimals"), nullEmpty(iou))
+	//
+	// `weight` is emitted by the META reserve only: each leg's target weight in bps
+	// (int256 — BaseLP = targetBaseLpBps, native = its complement), fixed at
+	// initialize. It is NULL for a base reserve, which values its assets at par and
+	// has no target weights.
+	return exec(tx, `INSERT INTO clear_reserve_assets (chain_id, reserve, asset, decimals, iou, position, weight)
+VALUES ($1, $2, $3, $4, $5, (SELECT count(*) FROM clear_reserve_assets WHERE chain_id = $1 AND reserve = $2), $6)
+ON CONFLICT (chain_id, reserve, asset) DO UPDATE SET
+  decimals = EXCLUDED.decimals, iou = EXCLUDED.iou, weight = EXCLUDED.weight`,
+		log.ChainId, reserve, normAddr(a["asset"]), nullNum(a, "decimals"), nullEmpty(iou), nullNum(a, "weight"))
 }
 
 // --- curve pool events ---
@@ -588,16 +599,193 @@ ON CONFLICT (chain_id, asset) DO UPDATE SET
 }
 
 // handleOraclePublish records the adapter's price refresh. It does not overwrite
-// `oracle` — log.Address here is the adapter, not the ClearOracle.
+// `oracle` — log.Address here is the adapter, not the ClearOracle. `publishTime`
+// is Pyth's own timestamp for the price (when the feed published it, which is
+// older than the block that pushed it on-chain), kept alongside last_refresh so
+// staleness can be judged against the source rather than against inclusion.
 func handleOraclePublish(tx *sql.Tx, log exporter.LogEvent) error {
 	a := log.Args
 	asset := normAddr(a["asset"])
 	if asset == "" {
 		return nil
 	}
-	return exec(tx, `INSERT INTO clear_oracle_prices (chain_id, asset, price, last_refresh, last_block)
-VALUES ($1,$2,$3,$4,$5)
+	return exec(tx, `INSERT INTO clear_oracle_prices (chain_id, asset, price, publish_time, last_refresh, last_block)
+VALUES ($1,$2,$3,$4,$5,$6)
 ON CONFLICT (chain_id, asset) DO UPDATE SET
-  price = EXCLUDED.price, last_refresh = EXCLUDED.last_refresh, last_block = EXCLUDED.last_block`,
-		log.ChainId, asset, num(a, "price"), log.BlockTimestamp, log.BlockNumber)
+  price = EXCLUDED.price, publish_time = EXCLUDED.publish_time,
+  last_refresh = EXCLUDED.last_refresh, last_block = EXCLUDED.last_block`,
+		log.ChainId, asset, num(a, "price"), nullNum(a, "publishTime"), log.BlockTimestamp, log.BlockNumber)
+}
+
+// --- reserve governance settings ---
+//
+// Every set* function on a reserve emits its own event (see RESERVE-SETTINGS.md in
+// the contracts repo). They all fold into one row per reserve in
+// clear_reserve_settings, each event patching only the column(s) it carries, so the
+// row is created or updated in any order and always holds the latest value of each
+// parameter. Parameters fixed at initialize (targetBaseLpBps, the asset set) are not
+// emitted as settings events — the meta legs' target weights come through
+// AssetAdded instead (clear_reserve_assets.weight).
+
+// handleReserveSettings upserts the reserve's settings row. colVals is a flat list
+// of column/value pairs (column names are code constants, never event data).
+func handleReserveSettings(tx *sql.Tx, log exporter.LogEvent, k contractKind, colVals ...string) error {
+	if len(colVals) == 0 || len(colVals)%2 != 0 {
+		return fmt.Errorf("reserve settings %s: malformed column/value list", log.EventName)
+	}
+	reserve := normAddr(log.Address)
+	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
+		return err
+	}
+
+	cols := []string{"chain_id", "reserve", "kind"}
+	args := []any{log.ChainId, reserve, k.reserveType()}
+	for i := 0; i < len(colVals); i += 2 {
+		cols = append(cols, colVals[i])
+		args = append(args, colVals[i+1])
+	}
+	cols = append(cols, "last_block")
+	args = append(args, log.BlockNumber)
+
+	ph := make([]string, len(cols))
+	for i := range cols {
+		ph[i] = fmt.Sprintf("$%d", i+1)
+	}
+	// Only the event's own columns (and last_block) are refreshed on conflict; the
+	// key columns and every other setting keep their stored value.
+	sets := make([]string, 0, len(cols)-3)
+	for _, c := range cols[3:] {
+		sets = append(sets, c+" = EXCLUDED."+c)
+	}
+	return exec(tx, fmt.Sprintf(`INSERT INTO clear_reserve_settings (%s) VALUES (%s)
+ON CONFLICT (chain_id, reserve) DO UPDATE SET %s`,
+		strings.Join(cols, ", "), strings.Join(ph, ", "), strings.Join(sets, ", ")), args...)
+}
+
+// --- IOU treasury fees ---
+
+// handleIouTreasuryFee accumulates the treasury's cut of an IOU mint. The paired
+// Transfer events already move supply and balances; ClearIOUMinted is the only
+// place the fee split (user amount vs treasuryFee) is visible, so it is summed
+// per IOU token.
+func handleIouTreasuryFee(tx *sql.Tx, log exporter.LogEvent) error {
+	token := normAddr(log.Address)
+	if err := ensureIou(tx, log.ChainId, token, log.BlockNumber); err != nil {
+		return err
+	}
+	fee := num(log.Args, "treasuryFee")
+	if fee == "0" {
+		return nil
+	}
+	return exec(tx, `UPDATE clear_iou_tokens SET treasury_fees = treasury_fees + $3, last_block = $4
+WHERE chain_id = $1 AND address = $2`, log.ChainId, token, fee, log.BlockNumber)
+}
+
+// --- reserve factory (ClearReserveFactory) ---
+
+// reserveKindFromType decodes the NewClearReserve `reserveType` enum
+// (0 = BASE_RESERVE, 1 = META_RESERVE), tolerating both the numeric form evmi
+// emits for a uint8 enum and the symbolic spellings.
+func reserveKindFromType(s string) contractKind {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "0", "base_reserve", "basereserve", "base":
+		return baseReserveKind
+	case "1", "meta_reserve", "metareserve", "meta":
+		return metaReserveKind
+	}
+	return unknownKind
+}
+
+// handleNewClearReserve records a reserve at its creation and registers it in the
+// contract registry with the kind the factory announced — so the reserve is routed
+// correctly from its very first event without being listed in pluginConfig.
+// (The reserve's logs still have to be delivered: evmi needs a pipeline source for
+// that address, since one FACTORY source can only spawn children of a single ABI
+// and the factory deploys two different ones.)
+func (e *clearExporter) handleNewClearReserve(tx *sql.Tx, log exporter.LogEvent) error {
+	a := log.Args
+	reserve := normAddr(a["reserve"])
+	if reserve == "" || isZeroAddr(reserve) {
+		return nil
+	}
+	k := reserveKindFromType(a["reserveType"])
+	if k == unknownKind {
+		return fmt.Errorf("NewClearReserve %s: unrecognized reserveType %q", log.Id, a["reserveType"])
+	}
+	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
+		return err
+	}
+	// `tokens` is an address[]; evmi serializes it as a JSON array of strings, which
+	// goes into JSONB as-is (lowercased to match every other stored address).
+	tokens := jsonArg(a, "tokens")
+	if tokens.Valid {
+		tokens.String = strings.ToLower(tokens.String)
+	}
+	if err := exec(tx, `UPDATE clear_reserves
+SET name = $3, symbol = $4, implementation = $5, reserve_index = $6, tokens = $7, factory = $8
+WHERE chain_id = $1 AND address = $2`,
+		log.ChainId, reserve, nullEmpty(a["name"]), nullEmpty(a["symbol"]),
+		nullEmpty(normAddr(a["implementation"])), nullNum(a, "index"), tokens,
+		normAddr(log.Address)); err != nil {
+		return err
+	}
+	return e.trackContract(tx, log.ChainId, reserve, k, log.BlockNumber)
+}
+
+// handleFactoryConfig patches one column of the factory's protocol-config row
+// (the factory IS the IClearReserveConfig every reserve points at).
+func handleFactoryConfig(tx *sql.Tx, log exporter.LogEvent, col, value string) error {
+	if value == "" {
+		return nil
+	}
+	return exec(tx, fmt.Sprintf(`INSERT INTO clear_protocol_config (chain_id, factory, %s, last_block)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (chain_id, factory) DO UPDATE SET %s = EXCLUDED.%s, last_block = EXCLUDED.last_block`,
+		col, col, col), log.ChainId, normAddr(log.Address), value, log.BlockNumber)
+}
+
+// handleFactoryImplementation records an implementation upgrade (address + the
+// version the factory bumped it to). Affects future deployments only.
+func handleFactoryImplementation(tx *sql.Tx, log exporter.LogEvent, implCol, versionCol string) error {
+	impl := normAddr(log.Args["implementation"])
+	if impl == "" || isZeroAddr(impl) {
+		return nil
+	}
+	return exec(tx, fmt.Sprintf(`INSERT INTO clear_protocol_config (chain_id, factory, %s, %s, last_block)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (chain_id, factory) DO UPDATE SET
+  %s = EXCLUDED.%s, %s = EXCLUDED.%s, last_block = EXCLUDED.last_block`,
+		implCol, versionCol, implCol, implCol, versionCol, versionCol),
+		log.ChainId, normAddr(log.Address), impl, nullNum(log.Args, "version"), log.BlockNumber)
+}
+
+// --- curve pool deployer (ClearCurvePoolDeployer) ---
+
+// handlePoolDeployed records a Curve pool at its creation, links it back to the
+// reserve it was deployed for, and registers it as a tracked curve pool so its own
+// events route to dispatchCurve. `coin` is the zero address on the reserve's plain
+// base pool (there `pool == basePool`); on a metapool it is the coin paired against
+// the base pool — an asset's IOU, or a meta reserve's native token / native IOU.
+func (e *clearExporter) handlePoolDeployed(tx *sql.Tx, log exporter.LogEvent) error {
+	a := log.Args
+	pool := normAddr(a["pool"])
+	if pool == "" || isZeroAddr(pool) {
+		return nil
+	}
+	if err := ensureCurve(tx, log.ChainId, pool, log.BlockNumber); err != nil {
+		return err
+	}
+	coin := normAddr(a["coin"])
+	isBase := coin == "" || isZeroAddr(coin)
+	if isBase {
+		coin = ""
+	}
+	if err := exec(tx, `UPDATE clear_curve_pools
+SET reserve = $3, base_pool = $4, coin = $5, is_base_pool = $6, deployer = $7
+WHERE chain_id = $1 AND address = $2`,
+		log.ChainId, pool, nullEmpty(normAddr(a["reserve"])), nullEmpty(normAddr(a["basePool"])),
+		nullEmpty(coin), isBase, normAddr(log.Address)); err != nil {
+		return err
+	}
+	return e.trackContract(tx, log.ChainId, pool, curveKind, log.BlockNumber)
 }

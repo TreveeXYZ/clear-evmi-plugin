@@ -14,16 +14,25 @@ Everything is derived **purely from events** (an exporter plugin gets no RPC acc
 
 | Table | Content |
 |-------|---------|
-| `clear_reserves` | per reserve: `kind` (base/meta), `lp_supply`, cumulative `total_deposits`/`total_withdrawals`, `iou_minted`/`iou_redeemed`, `swap_count` |
+| `clear_contracts` | address → kind routing registry (`base_reserve`, `meta_reserve`, `iou`, `curve`, `oracle`, `factory`, `curve_deployer`) |
+| `clear_reserves` | per reserve: `kind` (base/meta), `lp_supply`, cumulative `total_deposits`/`total_withdrawals`, `iou_minted`/`iou_redeemed`, `swap_count`, plus `name`/`symbol`/`implementation`/`tokens` from the factory's `NewClearReserve` |
+| `clear_reserve_settings` | per reserve: every governance parameter, folded from the `set*` events (fees, distributions, swap-spread window, rebalance trigger, deposit-weight tolerance) |
 | `clear_reserve_lp_balances` | `(reserve, holder) → balance` — every LP holder |
-| `clear_reserve_assets` | reserve's underlying assets + their IOU token (from `AssetAdded`) |
+| `clear_reserve_assets` | reserve's assets + their IOU token and `iou_supply` (from `AssetAdded`); for a **meta** reserve, its two legs with each leg's target `weight` in bps |
+| `clear_reserve_token_balances` | a **base** reserve's physical ERC20 holdings per asset, reconstructed from event token-flows |
 | `clear_reserve_swaps` | depeg `Swap` history (amounts + IOU split) |
 | `clear_reserve_activity` | deposits, withdrawals, single-asset ops, rebalances, IOU mint/redeem, flash loans |
-| `clear_iou_tokens` / `clear_iou_balances` | IOU supply and per-holder balances |
-| `clear_curve_pools` | per pool: `lp_supply`, `swap_count` |
+| `clear_reserve_value_history` | daily end-of-day `total_assets` / `total_supply` per base reserve (for TVL charts) |
+| `clear_iou_tokens` / `clear_iou_balances` | IOU supply, cumulative `treasury_fees`, and per-holder balances |
+| `clear_oracle_prices` | per asset: price, redemption price, TTL, decimals, enabled, last refresh — folded from `ClearOracle` + `PythOracleAdapter` |
+| `clear_oracle_price_history` | every `ClearOracleRateChanged` as a price point (for charts) |
+| `clear_protocol_config` | the factory's protocol-wide config: `treasury` and each clone implementation + version |
+| `clear_curve_pools` | per pool: `lp_supply`, `swap_count`, and the reserve / base pool / paired coin it was deployed for |
 | `clear_curve_lp_balances` | `(pool, holder) → balance` |
 | `clear_curve_swaps` | `TokenExchange` / `TokenExchangeUnderlying` history |
 | `clear_curve_liquidity` | add/remove liquidity history (token amounts as JSON, `token_supply`) |
+
+Every table carries `chain_id`, so one database can hold more than one chain.
 
 Amounts are `NUMERIC` (uint256-safe); addresses are stored lowercased.
 
@@ -39,16 +48,25 @@ go build -buildmode=plugin -o clear-defi.so ./examples/exporters/clear-defi
 
 ## Configure in EVMI
 
-1. **ABIs** — create one `EvmJsonAbi` per contract type. **The plugin classifies contracts by
-   ABI `ContractName` (case-insensitive substring)**, so name them so they contain:
+1. **ABIs** — create one `EvmJsonAbi` per contract type. Routing is by **address**, from the
+   registry seeded by `pluginConfig.contracts`; the ABI `ContractName` is only the fallback used
+   the first time an unregistered address is seen (case-insensitive substring), so name them so
+   they contain:
    - `Base` + `Reserve` → e.g. `ClearBaseReserve` (must include ERC20 `Transfer` + the reserve events)
    - `Meta` + `Reserve` → e.g. `ClearMetaReserve`
    - `IOU` → e.g. `ClearIOU`
    - `Curve` / `StableSwap` / `Pool` → e.g. `CurveStableSwapNG` (include `Transfer`, `TokenExchange`, and the liquidity events)
+   - `Oracle` → e.g. `ClearOracle`, `PythOracleAdapter`
+   - `Reserve` + `Factory` → `ClearReserveFactory`; `Deployer` → `ClearCurvePoolDeployer`
+     (both matched *before* the generic reserve/curve cases)
 2. **Blockchain**, **log store**, **pipeline** — as usual.
-3. **Sources** — add a source per contract (CONTRACT), or a FACTORY source on
-   `ClearReserveFactory` / the Curve deployer with the right child ABI so new reserves/pools are
-   picked up automatically. All sources must be in the **same pipeline** the exporter reads.
+3. **Sources** — add a source per contract (CONTRACT), plus FACTORY sources for the contracts that
+   spawn others: each reserve spawns its `ClearIOU`s via `AssetAdded`, and the
+   `ClearCurvePoolDeployer` spawns `CurveStableSwapNG` pools via `PoolDeployed`. The
+   `ClearReserveFactory` cannot be a FACTORY source — it deploys two different child ABIs
+   (base and meta reserves) and a factory source spawns only one — so each reserve needs its own
+   source entry, though the exporter still registers it in `clear_contracts` from
+   `NewClearReserve`. All sources must be in the **same pipeline** the exporter reads.
 4. **Plugin** — install this plugin (`InstallPlugin`).
 5. **Exporter** — create an `EvmiExporter` bound to the pipeline with config:
 
@@ -69,12 +87,18 @@ go build -buildmode=plugin -o clear-defi.so ./examples/exporters/clear-defi
 `autoload.config.json` in this folder wires the whole thing declaratively — pass it as the EVMI
 server config and every resource below is created on startup if absent (idempotent):
 
-- the four **ABIs** (named for the classifier), a **blockchain** (sepolia), a **log store**
-  (clickhouse), a **pipeline** (`clear`), and the **exporter** (with its Postgres `dsn`);
-- the **base reserve as a `FACTORY` source** — it indexes the reserve's own events *and*
+- the eight **ABIs** (`ClearBaseReserve`, `ClearMetaReserve`, `ClearIOU`, `ClearReserveFactory`,
+  `ClearCurvePoolDeployer`, `CurveStableSwapNG`, `ClearOracle`, `PythOracleAdapter` — generated
+  from the deployed artifacts), a **blockchain** (sepolia), a **log store** (clickhouse), a
+  **pipeline** (`clear`), and the **exporter** (with its Postgres `dsn` and the address→kind
+  `contracts` registry);
+- the **base and meta reserves as `FACTORY` sources** — each indexes the reserve's own events *and*
   auto-creates a `ClearIOU` `CONTRACT` child source for every IOU announced via `AssetAdded`
-  (`factoryCreationAddressLogArg: "iou"`); the meta reserve and a Curve pool are plain `CONTRACT`
-  sources;
+  (`factoryCreationAddressLogArg: "iou"`);
+- the **`ClearCurvePoolDeployer` as a `FACTORY` source** — every pool it deploys becomes a
+  `CurveStableSwapNG` child source (`PoolDeployed` / `pool`);
+- the **`ClearReserveFactory`**, both oracle contracts and any externally-deployed Curve pool as
+  plain `CONTRACT` sources;
 - the plugin itself (via `plugins`, from your git repo).
 
 **Replace the placeholders first** (they're marked with `0x…`/`<...>`): the RPC URL and key, the
@@ -123,10 +147,15 @@ GROUP BY p.address, p.lp_supply;
 
 ## Notes / limitations
 
-- **Reserve on-chain token reserves** (how much USDC/USDT a reserve physically holds) are not
-  reconstructed here — that needs the ERC20 `Transfer`s of the *underlying* tokens to/from the
-  reserve (index those tokens too if you want it) or periodic RPC snapshots. This plugin tracks LP
-  supply, flows, IOU, and per-holder LP/IOU balances, which is what the events give exactly.
+- **Reserve on-chain token holdings** are reconstructed for **base** reserves only
+  (`clear_reserve_token_balances`), by applying every event's token-flow as a signed delta —
+  exact only when indexing starts at the reserve's deployment. A **meta** reserve's holdings are
+  not: it now emits `AssetAdded` per leg, so its legs are registered, but its balanced
+  `Deposit`/`Withdraw` carry named scalars (`baseLpIn`/`nativeIn`) with nothing tying a scalar to
+  a leg address.
+- **Reserve settings** are only observable once a `set*` function is actually called — the
+  contract defaults are not emitted at `initialize`, so a column in `clear_reserve_settings` stays
+  NULL until then (see `RESERVE-SETTINGS.md` in the contracts repo for the defaults).
 - Curve LP `lp_supply` is tracked from the pool's ERC20 `Transfer`s (mint/burn); the `token_supply`
   reported by each liquidity event is also stored per-row in `clear_curve_liquidity`.
 - If indexing starts mid-history, holders who received tokens before the start block can show

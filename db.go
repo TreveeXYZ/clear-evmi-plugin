@@ -12,7 +12,8 @@ const zeroAddress = "0x0000000000000000000000000000000000000000"
 // contractKind classifies a source contract from its ABI ContractName so the same
 // event name (e.g. Transfer) can be routed to the right table. Matching is
 // case-insensitive and substring-based, so ABIs only need sensible names
-// (…Base…Reserve, …Meta…Reserve, …IOU…, …Curve…/…StableSwap…/…Pool…).
+// (…Base…Reserve, …Meta…Reserve, …IOU…, …Curve…/…StableSwap…/…Pool…,
+// …Reserve…Factory…, …Deployer…).
 type contractKind int
 
 const (
@@ -22,13 +23,27 @@ const (
 	iouKind
 	curveKind
 	oracleKind
+	// factoryKind is the ClearReserveFactory: it announces every reserve it
+	// deploys (NewClearReserve) and holds the protocol-wide config (treasury,
+	// implementations).
+	factoryKind
+	// curveDeployerKind is the ClearCurvePoolDeployer: it announces every Curve
+	// pool it deploys for a reserve (PoolDeployed).
+	curveDeployerKind
 )
 
+// classify is the first-sight fallback used when an address is not yet in the
+// registry. Order matters: the deployer/factory names also contain "pool" and
+// "reserve", so they have to be matched before the generic curve/reserve cases.
 func classify(contractName string) contractKind {
 	n := strings.ToLower(contractName)
 	switch {
 	case strings.Contains(n, "oracle"):
 		return oracleKind
+	case strings.Contains(n, "deployer"):
+		return curveDeployerKind
+	case strings.Contains(n, "factory") && strings.Contains(n, "reserve"):
+		return factoryKind
 	case strings.Contains(n, "meta") && strings.Contains(n, "reserve"):
 		return metaReserveKind
 	case strings.Contains(n, "base") && strings.Contains(n, "reserve"):

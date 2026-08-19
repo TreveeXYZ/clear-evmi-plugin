@@ -30,9 +30,12 @@ CREATE TABLE IF NOT EXISTS clear_processed_events (
 -- The exporter looks up a log's contract by ADDRESS here instead of re-classifying
 -- its ABI name on every event. Seeded from pluginConfig.contracts on Init
 -- (source='config') and extended at runtime whenever a new contract is detected —
--- a factory-spawned IOU at AssetAdded, or any address seen for the first time
+-- a reserve-spawned IOU at AssetAdded, a reserve announced by the
+-- ClearReserveFactory (NewClearReserve), a Curve pool announced by the
+-- ClearCurvePoolDeployer (PoolDeployed), or any address seen for the first time
 -- (source='dynamic'). Reloaded into the in-memory registry on start so discovery
--- survives restarts. kind is one of: base_reserve, meta_reserve, iou, curve, oracle.
+-- survives restarts. kind is one of: base_reserve, meta_reserve, iou, curve,
+-- oracle, factory, curve_deployer.
 CREATE TABLE IF NOT EXISTS clear_contracts (
     chain_id    BIGINT NOT NULL,
     address     TEXT NOT NULL,
@@ -44,6 +47,9 @@ CREATE TABLE IF NOT EXISTS clear_contracts (
 CREATE INDEX IF NOT EXISTS clear_contracts_kind ON clear_contracts (chain_id, kind);
 
 -- Reserves (Clear base/meta reserves; the LP token IS the reserve contract).
+-- name/symbol/implementation/reserve_index/tokens/factory come from the factory's
+-- NewClearReserve event and are NULL for a reserve indexed from its own logs only
+-- (i.e. when indexing starts after its deployment, or the factory isn't a source).
 CREATE TABLE IF NOT EXISTS clear_reserves (
     chain_id          BIGINT NOT NULL,
     address           TEXT NOT NULL,
@@ -54,9 +60,70 @@ CREATE TABLE IF NOT EXISTS clear_reserves (
     iou_minted        NUMERIC NOT NULL DEFAULT 0,
     iou_redeemed      NUMERIC NOT NULL DEFAULT 0,
     swap_count        BIGINT  NOT NULL DEFAULT 0,
+    name              TEXT,
+    symbol            TEXT,
+    implementation    TEXT,
+    reserve_index     BIGINT,
+    tokens            JSONB,
+    factory           TEXT,
     first_block       BIGINT,
     last_block        BIGINT,
     PRIMARY KEY (chain_id, address)
+);
+-- Idempotent migrations for databases created before NewClearReserve was indexed.
+ALTER TABLE clear_reserves ADD COLUMN IF NOT EXISTS name TEXT;
+ALTER TABLE clear_reserves ADD COLUMN IF NOT EXISTS symbol TEXT;
+ALTER TABLE clear_reserves ADD COLUMN IF NOT EXISTS implementation TEXT;
+ALTER TABLE clear_reserves ADD COLUMN IF NOT EXISTS reserve_index BIGINT;
+ALTER TABLE clear_reserves ADD COLUMN IF NOT EXISTS tokens JSONB;
+ALTER TABLE clear_reserves ADD COLUMN IF NOT EXISTS factory TEXT;
+
+-- Reserve governance parameters, one row per reserve, folded from the set* events
+-- (ConfigUpdated, FlashFeeUpdated, BaseQuoteFeeBpsUpdated, SingleAssetFeeBpsUpdated,
+-- RedemptionProximityBpsUpdated, RebalanceTriggerBpsUpdated,
+-- DepositWeightToleranceBpsUpdated, IouDistributionUpdated,
+-- BaseQuoteDistributionUpdated, SwapSpreadBpsUpdated). Each event patches only its
+-- own column(s), so a column is NULL until its parameter is first set — the
+-- contract defaults (see RESERVE-SETTINGS.md) are NOT emitted at initialize and so
+-- cannot be observed from events. rebalance_trigger_bps is base-only,
+-- deposit_weight_tolerance_bps meta-only.
+CREATE TABLE IF NOT EXISTS clear_reserve_settings (
+    chain_id                     BIGINT NOT NULL,
+    reserve                      TEXT NOT NULL,
+    kind                         TEXT NOT NULL,
+    config_address               TEXT,
+    flash_fee_bps                NUMERIC,
+    base_quote_fee_bps           NUMERIC,
+    single_asset_fee_bps         NUMERIC,
+    redemption_proximity_bps     NUMERIC,
+    rebalance_trigger_bps        NUMERIC,
+    deposit_weight_tolerance_bps NUMERIC,
+    iou_trader_bps               NUMERIC,
+    iou_treasury_bps             NUMERIC,
+    base_quote_trader_bps        NUMERIC,
+    base_quote_treasury_bps      NUMERIC,
+    swap_spread_min_bps          NUMERIC,
+    swap_spread_max_bps          NUMERIC,
+    last_block                   BIGINT,
+    PRIMARY KEY (chain_id, reserve)
+);
+
+-- Protocol-wide config held by the ClearReserveFactory (which IS the
+-- IClearReserveConfig every reserve points at): the treasury (NewTreasury) and the
+-- current implementation of each clone type with the version the factory bumped it
+-- to (New{BaseReserve,MetaReserve,IOU}Implementation). One row per factory.
+CREATE TABLE IF NOT EXISTS clear_protocol_config (
+    chain_id                    BIGINT NOT NULL,
+    factory                     TEXT NOT NULL,
+    treasury                    TEXT,
+    base_reserve_implementation TEXT,
+    base_reserve_version        NUMERIC,
+    meta_reserve_implementation TEXT,
+    meta_reserve_version        NUMERIC,
+    iou_implementation          TEXT,
+    iou_version                 NUMERIC,
+    last_block                  BIGINT,
+    PRIMARY KEY (chain_id, factory)
 );
 
 CREATE TABLE IF NOT EXISTS clear_reserve_lp_balances (
@@ -72,7 +139,10 @@ CREATE INDEX IF NOT EXISTS clear_reserve_lp_balances_holder ON clear_reserve_lp_
 -- Per-reserve asset registry (from AssetAdded), including the asset's IOU token.
 -- 'position' is the asset's index in the reserve's append-only assetList (== the
 -- AssetAdded emission order), used to map a Deposit/Withdraw amounts[i] back to
--- its token.
+-- its token. Both reserve types populate this: a BASE reserve emits AssetAdded once
+-- per underlying asset, a META reserve once per leg (native, then BaseLP).
+-- 'weight' is the leg's target weight in bps (int256) and is META-only — a base
+-- reserve values its assets at par and has no target weights, so it stays NULL.
 CREATE TABLE IF NOT EXISTS clear_reserve_assets (
     chain_id   BIGINT NOT NULL,
     reserve    TEXT NOT NULL,
@@ -81,11 +151,13 @@ CREATE TABLE IF NOT EXISTS clear_reserve_assets (
     iou        TEXT,
     position   INT,
     iou_supply NUMERIC NOT NULL DEFAULT 0,
+    weight     NUMERIC,
     PRIMARY KEY (chain_id, reserve, asset)
 );
 -- Idempotent migrations for reserves indexed before these columns existed.
 ALTER TABLE clear_reserve_assets ADD COLUMN IF NOT EXISTS position INT;
 ALTER TABLE clear_reserve_assets ADD COLUMN IF NOT EXISTS iou_supply NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE clear_reserve_assets ADD COLUMN IF NOT EXISTS weight NUMERIC;
 
 -- Reserve's physical ERC20 holdings, one row per underlying asset, reconstructed
 -- from the token flows in deposit/withdraw/single-asset/rebalance/swap/IOU/flash
@@ -145,14 +217,19 @@ CREATE TABLE IF NOT EXISTS clear_reserve_activity (
 CREATE INDEX IF NOT EXISTS clear_reserve_activity_reserve_block ON clear_reserve_activity (chain_id, reserve, block_number);
 CREATE INDEX IF NOT EXISTS clear_reserve_activity_action ON clear_reserve_activity (chain_id, action);
 
--- IOU tokens (ERC20 clone per asset per reserve).
+-- IOU tokens (ERC20 clone per asset per reserve). total_supply is derived from the
+-- zero-address Transfer decomposition; treasury_fees is the cumulative treasury cut
+-- of every mint, which only ClearIOUMinted carries (the Transfers show the combined
+-- movement, not the split).
 CREATE TABLE IF NOT EXISTS clear_iou_tokens (
-    chain_id     BIGINT NOT NULL,
-    address      TEXT NOT NULL,
-    total_supply NUMERIC NOT NULL DEFAULT 0,
-    last_block   BIGINT,
+    chain_id      BIGINT NOT NULL,
+    address       TEXT NOT NULL,
+    total_supply  NUMERIC NOT NULL DEFAULT 0,
+    treasury_fees NUMERIC NOT NULL DEFAULT 0,
+    last_block    BIGINT,
     PRIMARY KEY (chain_id, address)
 );
+ALTER TABLE clear_iou_tokens ADD COLUMN IF NOT EXISTS treasury_fees NUMERIC NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS clear_iou_balances (
     chain_id   BIGINT NOT NULL,
     token      TEXT NOT NULL,
@@ -168,7 +245,9 @@ CREATE INDEX IF NOT EXISTS clear_iou_balances_holder ON clear_iou_balances (chai
 -- (all on the ClearOracle contract) plus the PythOracleAdapter's PriceUpdated.
 -- last_refresh is the block-header timestamp (unix seconds) of the most recent
 -- oracle event — the "last refresh date". last_block is the same event's block
--- number. Keyed by (chain_id, asset) so both contracts fold into the same row.
+-- number. publish_time is Pyth's own timestamp for the price (PriceUpdated), i.e.
+-- when the feed published it rather than when it landed on-chain. Keyed by
+-- (chain_id, asset) so both contracts fold into the same row.
 CREATE TABLE IF NOT EXISTS clear_oracle_prices (
     chain_id         BIGINT NOT NULL,
     asset            TEXT NOT NULL,
@@ -179,10 +258,12 @@ CREATE TABLE IF NOT EXISTS clear_oracle_prices (
     price_ttl        NUMERIC,
     price            NUMERIC,
     redemption_price NUMERIC,
+    publish_time     BIGINT,
     last_refresh     BIGINT,
     last_block       BIGINT,
     PRIMARY KEY (chain_id, asset)
 );
+ALTER TABLE clear_oracle_prices ADD COLUMN IF NOT EXISTS publish_time BIGINT;
 
 -- Oracle price time series: one row per ClearOracleRateChanged (every price write,
 -- including Pyth-driven ones, funnels through it). Append-only, for charting price
@@ -214,15 +295,31 @@ CREATE TABLE IF NOT EXISTS clear_reserve_value_history (
 );
 
 -- Curve StableSwap-NG pools (IOU secondary market; LP token IS the pool).
+-- reserve/base_pool/coin/is_base_pool/deployer come from the ClearCurvePoolDeployer's
+-- PoolDeployed event and stay NULL for a pool indexed from its own logs only.
+-- is_base_pool marks the reserve's plain base pool (PoolDeployed carries coin = 0
+-- and pool == base_pool there); otherwise the pool is a metapool pairing `coin` —
+-- an asset's IOU, or a meta reserve's native token / native IOU — against base_pool.
 CREATE TABLE IF NOT EXISTS clear_curve_pools (
-    chain_id    BIGINT NOT NULL,
-    address     TEXT NOT NULL,
-    lp_supply   NUMERIC NOT NULL DEFAULT 0,
-    swap_count  BIGINT  NOT NULL DEFAULT 0,
-    first_block BIGINT,
-    last_block  BIGINT,
+    chain_id     BIGINT NOT NULL,
+    address      TEXT NOT NULL,
+    lp_supply    NUMERIC NOT NULL DEFAULT 0,
+    swap_count   BIGINT  NOT NULL DEFAULT 0,
+    reserve      TEXT,
+    base_pool    TEXT,
+    coin         TEXT,
+    is_base_pool BOOLEAN,
+    deployer     TEXT,
+    first_block  BIGINT,
+    last_block   BIGINT,
     PRIMARY KEY (chain_id, address)
 );
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS reserve TEXT;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS base_pool TEXT;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS coin TEXT;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS is_base_pool BOOLEAN;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS deployer TEXT;
+CREATE INDEX IF NOT EXISTS clear_curve_pools_reserve ON clear_curve_pools (chain_id, reserve);
 CREATE TABLE IF NOT EXISTS clear_curve_lp_balances (
     chain_id   BIGINT NOT NULL,
     pool       TEXT NOT NULL,

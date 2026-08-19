@@ -32,12 +32,24 @@ const (
 	carol    = "0x0000000000000000000000000000000000car01d0"
 	dave     = "0x00000000000000000000000000000000000dave00"
 	eve      = "0x0000000000000000000000000000000000000eve0"
+
+	// Discovery contracts and the entities they announce.
+	factory      = "0x00000000000000000000000000000000fac70201"
+	deployer     = "0x000000000000000000000000000000000dep10ee"
+	metaReserve  = "0x0000000000000000000000000000000me7are5e0"
+	nativeTok    = "0x00000000000000000000000000000000na7ive00"
+	metaIou1     = "0x00000000000000000000000000000000me7aiou1"
+	metaIou2     = "0x00000000000000000000000000000000me7aiou2"
+	iouPool      = "0x00000000000000000000000000000000ioupoo10"
+	treasuryAddr = "0x0000000000000000000000000000000007rea5u0"
+	implAddr     = "0x0000000000000000000000000000000000imp100"
 )
 
 var allTables = []string{
 	"clear_processed_events", "clear_contracts", "clear_reserves", "clear_reserve_lp_balances",
 	"clear_reserve_assets", "clear_reserve_token_balances", "clear_reserve_swaps",
-	"clear_reserve_activity", "clear_reserve_value_history", "clear_iou_tokens",
+	"clear_reserve_activity", "clear_reserve_value_history", "clear_reserve_settings",
+	"clear_protocol_config", "clear_iou_tokens",
 	"clear_iou_balances", "clear_oracle_prices", "clear_oracle_price_history",
 	"clear_curve_pools", "clear_curve_lp_balances", "clear_curve_swaps",
 	"clear_curve_liquidity",
@@ -98,16 +110,21 @@ func TestReplayProtocol(t *testing.T) {
 	raw.Close()
 
 	const R = "ClearBaseReserve"
+	const META = "ClearMetaReserve"
 	const IOU = "ClearIOU"
 	const CURVE = "CurveStableSwapNG"
 	const ORACLE = "ClearOracle"
 	const ADAPTER = "PythOracleAdapter"
+	const FACTORY = "ClearReserveFactory"
+	const DEPLOYER = "ClearCurvePoolDeployer"
 	const oracleAddr = "0x0000000000000000000000000000000000rac1e"
 	const adapterAddr = "0x00000000000000000000000000000000adap7e0"
 
 	e := &clearExporter{}
-	// Seed the address->kind registry from config (the reserve, pool and both
-	// oracle contracts). IOU tokens are discovered dynamically at AssetAdded.
+	// Seed the address->kind registry from config (the base reserve, pool, both
+	// oracle contracts, the reserve factory and the curve pool deployer). IOUs are
+	// discovered at AssetAdded, reserves at NewClearReserve, deployer-built pools at
+	// PoolDeployed — none of those need to be listed here.
 	cfg, _ := json.Marshal(pluginConfig{
 		Dsn: dsn,
 		Contracts: []contractConfig{
@@ -115,6 +132,8 @@ func TestReplayProtocol(t *testing.T) {
 			{Address: pool, Kind: "curve"},
 			{Address: oracleAddr, Kind: "oracle"},
 			{Address: adapterAddr, Kind: "oracle"},
+			{Address: factory, Kind: "factory"},
+			{Address: deployer, Kind: "curve_deployer"},
 		},
 	})
 	if err := e.Init(exporter.Context{ExporterName: "clear-defi-test", PipelineId: 1, ChainId: 1, Config: cfg}); err != nil {
@@ -179,6 +198,35 @@ func TestReplayProtocol(t *testing.T) {
 		mkLog(106, 1, ORACLE, oracleAddr, "ClearOracleRateChanged", map[string]string{"asset": usdc, "price": "99990000"}),
 		mkLog(106, 2, ORACLE, oracleAddr, "ClearOracleRedemptionPriceChanged", map[string]string{"asset": usdc, "redemptionPrice": "100000000"}),
 		mkLog(107, 0, ADAPTER, adapterAddr, "PriceUpdated", map[string]string{"asset": usdc, "price": "99990000", "publishTime": "1721600000"}),
+
+		// Governance settings on the base reserve: each event patches only its own
+		// column(s) of the reserve's clear_reserve_settings row.
+		mkLog(108, 0, R, reserve, "SingleAssetFeeBpsUpdated", map[string]string{"singleAssetFeeBps": "7"}),
+		mkLog(108, 1, R, reserve, "SwapSpreadBpsUpdated", map[string]string{"minBps": "3", "maxBps": "500"}),
+		mkLog(108, 2, R, reserve, "IouDistributionUpdated", map[string]string{"traderBps": "2000", "treasuryBps": "4000"}),
+		mkLog(108, 3, R, reserve, "RebalanceTriggerBpsUpdated", map[string]string{"triggerBps": "7000"}),
+		// The IOU's own mint event carries the treasury's cut, which the paired
+		// Transfers do not (they only show the combined movement).
+		mkLog(108, 4, IOU, iou1, "ClearIOUMinted", map[string]string{"to": carol, "amount": "5", "treasuryFee": "1"}),
+
+		// Factory: protocol config, then a meta reserve deployed. The meta reserve is
+		// registered from NewClearReserve alone — it is NOT in pluginConfig.contracts.
+		mkLog(109, 0, FACTORY, factory, "NewTreasury", map[string]string{"previousTreasury": zeroAddr, "newTreasury": treasuryAddr}),
+		mkLog(109, 1, FACTORY, factory, "NewMetaReserveImplementation", map[string]string{"version": "2", "implementation": implAddr}),
+		mkLog(109, 2, FACTORY, factory, "NewClearReserve", map[string]string{
+			"index": "1", "implementation": implAddr, "reserveType": "1", "reserve": metaReserve,
+			"name": "Clear Meta USD", "symbol": "cmUSD", "tokens": `["` + reserve + `","` + nativeTok + `"]`}),
+		// Meta AssetAdded: one per leg (native first, then BaseLP), each with the leg's
+		// IOU and its target weight in bps.
+		mkLog(109, 3, META, metaReserve, "AssetAdded", map[string]string{"asset": nativeTok, "decimals": "6", "iou": metaIou1, "weight": "2000"}),
+		mkLog(109, 4, META, metaReserve, "AssetAdded", map[string]string{"asset": reserve, "decimals": "18", "iou": metaIou2, "weight": "8000"}),
+
+		// Curve pool deployer: the reserve's plain base pool (coin = 0), then an IOU
+		// metapool against it. Both are registered as curve pools from these logs.
+		mkLog(110, 0, DEPLOYER, deployer, "PoolDeployed", map[string]string{
+			"reserve": reserve, "basePool": pool, "coin": zeroAddr, "pool": pool}),
+		mkLog(110, 1, DEPLOYER, deployer, "PoolDeployed", map[string]string{
+			"reserve": reserve, "basePool": pool, "coin": iou1, "pool": iouPool}),
 	}
 
 	for _, l := range logs {
@@ -277,10 +325,64 @@ func TestReplayProtocol(t *testing.T) {
 	eq(t, db, "add liquidity json", `SELECT count(*) FROM clear_curve_liquidity WHERE pool=$1 AND kind='add' AND token_amounts='["500","500"]'::jsonb AND token_supply=1000`, pool)
 	eq(t, db, "remove_one", `SELECT count(*) FROM clear_curve_liquidity WHERE pool=$1 AND kind='remove_one' AND token_amount=200 AND coin_amount=200`, pool)
 
+	// --- reserve governance settings ---
+	// One row per reserve; each event patched only its own column(s), and the ones
+	// never emitted (e.g. flash_fee_bps) stay NULL rather than defaulting to 0.
+	eq(t, db, "reserve settings", `SELECT count(*) FROM clear_reserve_settings
+		 WHERE reserve=$1 AND kind='base' AND single_asset_fee_bps=7
+		 AND swap_spread_min_bps=3 AND swap_spread_max_bps=500
+		 AND iou_trader_bps=2000 AND iou_treasury_bps=4000
+		 AND rebalance_trigger_bps=7000 AND flash_fee_bps IS NULL`, reserve)
+
+	// --- IOU treasury fee (only ClearIOUMinted carries the split) ---
+	eq(t, db, "iou treasury fee", `SELECT count(*) FROM clear_iou_tokens WHERE address=$1 AND total_supply=5 AND treasury_fees=1`, iou1)
+
+	// --- factory: protocol config + reserve discovery ---
+	eq(t, db, "protocol config", `SELECT count(*) FROM clear_protocol_config
+		 WHERE factory=$1 AND treasury=$2 AND meta_reserve_implementation=$3 AND meta_reserve_version=2`,
+		factory, treasuryAddr, implAddr)
+	eq(t, db, "meta reserve row", `SELECT count(*) FROM clear_reserves
+		 WHERE address=$1 AND kind='meta' AND name='Clear Meta USD' AND symbol='cmUSD'
+		 AND reserve_index=1 AND implementation=$2 AND factory=$3
+		 AND tokens = $4::jsonb`,
+		metaReserve, implAddr, factory, `["`+reserve+`","`+nativeTok+`"]`)
+	// The meta reserve was never configured: it is tracked purely from NewClearReserve.
+	eq(t, db, "meta reserve tracked (dynamic)", `SELECT count(*) FROM clear_contracts
+		 WHERE chain_id=1 AND address=$1 AND kind='meta_reserve' AND source='dynamic'`, metaReserve)
+
+	// --- meta reserve legs: AssetAdded now carries each leg's target weight ---
+	eq(t, db, "meta native leg", `SELECT count(*) FROM clear_reserve_assets
+		 WHERE reserve=$1 AND asset=$2 AND iou=$3 AND decimals=6 AND position=0 AND weight=2000`,
+		metaReserve, nativeTok, metaIou1)
+	eq(t, db, "meta baselp leg", `SELECT count(*) FROM clear_reserve_assets
+		 WHERE reserve=$1 AND asset=$2 AND iou=$3 AND decimals=18 AND position=1 AND weight=8000`,
+		metaReserve, reserve, metaIou2)
+	eq(t, db, "meta iou tracked", `SELECT count(*) FROM clear_contracts
+		 WHERE chain_id=1 AND address=$1 AND kind='iou' AND source='dynamic'`, metaIou1)
+	// weight is meta-only: a base reserve's assets have no target weight.
+	if got := count(t, db, `SELECT count(*) FROM clear_reserve_assets WHERE reserve=$1 AND weight IS NOT NULL`, reserve); got != 0 {
+		t.Errorf("base reserve assets with a weight = %d, want 0", got)
+	}
+
+	// --- curve pool deployer: pools linked back to their reserve ---
+	eq(t, db, "base pool metadata", `SELECT count(*) FROM clear_curve_pools
+		 WHERE address=$1 AND reserve=$2 AND base_pool=$1 AND is_base_pool AND coin IS NULL AND deployer=$3`,
+		pool, reserve, deployer)
+	eq(t, db, "iou metapool metadata", `SELECT count(*) FROM clear_curve_pools
+		 WHERE address=$1 AND reserve=$2 AND base_pool=$3 AND is_base_pool = FALSE AND coin=$4`,
+		iouPool, reserve, pool, iou1)
+	eq(t, db, "iou metapool tracked (dynamic)", `SELECT count(*) FROM clear_contracts
+		 WHERE chain_id=1 AND address=$1 AND kind='curve' AND source='dynamic'`, iouPool)
+	// The base pool was seeded from config; PoolDeployed must not downgrade its row.
+	eq(t, db, "base pool still config-sourced", `SELECT count(*) FROM clear_contracts
+		 WHERE chain_id=1 AND address=$1 AND kind='curve' AND source='config'`, pool)
+
 	// --- idempotency: redelivering logs must not double-apply ---
 	redeliver := []exporter.LogEvent{
 		mkLog(100, 2, R, reserve, "Transfer", map[string]string{"from": zeroAddr, "to": alice, "value": "1000"}),
 		mkLog(100, 3, R, reserve, "Deposit", map[string]string{"caller": alice, "receiver": alice, "lpMinted": "1000", "amounts": `["1000","1000"]`}),
+		// treasury_fees is cumulative like the balances, so it must not double either.
+		mkLog(108, 4, IOU, iou1, "ClearIOUMinted", map[string]string{"to": carol, "amount": "5", "treasuryFee": "1"}),
 	}
 	for _, l := range redeliver {
 		if err := e.NewLogEvent(l); err != nil {
@@ -290,4 +392,5 @@ func TestReplayProtocol(t *testing.T) {
 	eq(t, db, "alice LP after redeliver (unchanged)", `SELECT count(*) FROM clear_reserve_lp_balances WHERE reserve=$1 AND holder=$2 AND balance=$3`, reserve, alice, "700")
 	eq(t, db, "reserve supply after redeliver (unchanged)", `SELECT count(*) FROM clear_reserves WHERE address=$1 AND lp_supply=1450 AND total_deposits=1550`, reserve)
 	eq(t, db, "usdc holdings after redeliver (unchanged)", `SELECT count(*) FROM clear_reserve_token_balances WHERE reserve=$1 AND asset=$2 AND balance=$3`, reserve, usdc, "1525")
+	eq(t, db, "iou treasury fee after redeliver (unchanged)", `SELECT count(*) FROM clear_iou_tokens WHERE address=$1 AND treasury_fees=1`, iou1)
 }

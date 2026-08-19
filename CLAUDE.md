@@ -9,9 +9,12 @@ An **EVMI exporter plugin** (Go, `package main`, built with `-buildmode=plugin`)
 ## Commands
 
 ```bash
-# Build the plugin (.so). MUST use the same Go toolchain + module versions as the EVMI server,
-# or the server cannot load the plugin.
-go build -buildmode=plugin -o clear-defi.so .
+# Build the plugin (.so), Linux only. MUST use the same Go toolchain + module versions as the
+# EVMI server or it cannot load it (plugin.Open: "built with a different version of package ...").
+# build.sh pins GOTOOLCHAIN to the indexer's Go release (go1.24.9); go.mod pins deps to what the
+# server's own module graph resolves (lib/pq v1.10.9 — do NOT let `go get -u` bump it).
+./build.sh                     # -> clear-defi.so
+GO_VERSION=go1.25.1 ./build.sh # override when the server moves Go release
 
 go vet ./...
 go test ./...                    # unit tests only (classify/neg/firstArg/... in helpers_test.go)

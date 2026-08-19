@@ -38,10 +38,27 @@ Amounts are `NUMERIC` (uint256-safe); addresses are stored lowercased.
 
 ## Build
 
-Build with the **same Go toolchain and module versions** as the EVMI server:
+A Go plugin is loadable **only** by a host built with the identical Go release *and*
+identical versions of every dependency they share — otherwise `plugin.Open` fails with
+`plugin was built with a different version of package ...`. Both are pinned here:
+
+- `go.mod` requires the exact dependency versions the EVMI server resolves
+  (notably `github.com/lib/pq v1.10.9` — the server's graph pins it, so don't let
+  `go get -u` bump it);
+- `build.sh` sets `GOTOOLCHAIN` to the Go release matching the indexer's `go` directive
+  (currently `go1.24.9`), which Go downloads on demand.
 
 ```bash
-go build -buildmode=plugin -o clear-defi.so ./examples/exporters/clear-defi
+./build.sh                     # -> clear-defi.so, built with go1.24.9
+GO_VERSION=go1.25.1 ./build.sh # if the server moves to another Go release
+```
+
+Linux `.so` only — build it on Linux (or WSL), not on Windows/macOS.
+
+To re-check the target Go release after bumping the indexer dependency:
+
+```bash
+go list -m -f '{{.GoVersion}}' github.com/evmi-cloud/go-evm-indexer
 ```
 
 (Or let EVMI build it from source: install a `Plugin` pointing at this git repo / path.)

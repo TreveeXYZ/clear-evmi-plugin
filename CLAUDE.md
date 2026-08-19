@@ -9,12 +9,16 @@ An **EVMI exporter plugin** (Go, `package main`, built with `-buildmode=plugin`)
 ## Commands
 
 ```bash
-# Build the plugin (.so), Linux only. MUST use the same Go toolchain + module versions as the
-# EVMI server or it cannot load it (plugin.Open: "built with a different version of package ...").
-# build.sh pins GOTOOLCHAIN to the indexer's Go release (go1.24.9); go.mod pins deps to what the
-# server's own module graph resolves (lib/pq v1.10.9 — do NOT let `go get -u` bump it).
-./build.sh                     # -> clear-defi.so
-GO_VERSION=go1.25.1 ./build.sh # override when the server moves Go release
+# Build the .so. NOT a plain `go build`: plugin.Open compares a pkghash per shared
+# package, which depends on (1) the Go release the SERVER was built with (go.mod's `go`
+# directive is only a minimum — the image uses go1.24.13), (2) every shared dep version
+# (lib/pq v1.10.9; go-evm-indexer pinned to the image's commit), and (3) the absolute
+# path the indexer was compiled from (/app, no -trimpath). build.sh reads (1) and the
+# indexer commit off the EVMI image, checks that commit out at /app in a container,
+# `replace`s go.mod onto it, builds, and diffs every shared pkghash against the real
+# /evm-indexer binary — refusing to emit a .so that would fail plugin.Open. Linux only.
+./build.sh                              # -> clear-defi.so (auto-detects everything)
+EVMI_IMAGE=... GO_VERSION=... ./build.sh # override if the server image differs
 
 go vet ./...
 go test ./...                    # unit tests only (classify/neg/firstArg/... in helpers_test.go)

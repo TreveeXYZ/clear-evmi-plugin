@@ -38,30 +38,62 @@ Amounts are `NUMERIC` (uint256-safe); addresses are stored lowercased.
 
 ## Build
 
-A Go plugin is loadable **only** by a host built with the identical Go release *and*
-identical versions of every dependency they share — otherwise `plugin.Open` fails with
-`plugin was built with a different version of package ...`. Both are pinned here:
+A Go plugin loads **only** if, for every package it shares with the host, an 8-byte
+`pkghash` is identical — otherwise `plugin.Open` fails with
+`plugin was built with a different version of package …`. That hash depends on three
+things, all of which must match the EVMI server binary:
 
-- `go.mod` requires the exact dependency versions the EVMI server resolves
-  (notably `github.com/lib/pq v1.10.9` — the server's graph pins it, so don't let
-  `go get -u` bump it);
-- `build.sh` sets `GOTOOLCHAIN` to the Go release matching the indexer's `go` directive
-  (currently `go1.24.9`), which Go downloads on demand.
+1. **the Go release** — `go.mod`'s `go` directive is only a *minimum*; the published
+   image is built with a later patch release (go.mod says 1.24.9, the image uses
+   go1.24.13);
+2. **every shared dependency version** — `go.mod` must resolve exactly what the server
+   linked (notably `github.com/lib/pq v1.10.9`; don't let `go get -u` bump it), and the
+   `go-evm-indexer` pseudo-version must be the **commit the image was built from**;
+3. **the absolute path the indexer source was compiled from** — the indexer builds
+   without `-trimpath` from `WORKDIR /app`, so `/app/pkg/exporter/…` is baked into the
+   hash. A plugin that pulls the indexer from the module cache compiles the *same source*
+   at `/go/pkg/mod/…@v…/pkg/exporter` and gets a **different** hash.
+
+(3) is the one that bites, and it is why `go build -buildmode=plugin` alone is not
+enough — including the build EVMI itself runs when it clones the repo and compiles it
+in-container. `-trimpath` does not fix it either: a trimpath'd host and a trimpath'd
+plugin still disagree, because one compiles the package as the main module and the other
+as a dependency. Matching the path is what works.
+
+`build.sh` does all of it, and refuses to emit a `.so` that would not load:
 
 ```bash
-./build.sh                     # -> clear-defi.so, built with go1.24.9
-GO_VERSION=go1.25.1 ./build.sh # if the server moves to another Go release
+./build.sh            # -> clear-defi.so, verified against the real server binary
 ```
 
-Linux `.so` only — build it on Linux (or WSL), not on Windows/macOS.
+It reads the target Go release and indexer commit **off the EVMI image itself**
+(`org.opencontainers.image.revision` + the binary's stamp), checks that commit out at
+`/app` inside a `golang:<release>-bookworm` container, points the plugin's `go.mod` there
+with a `replace`, builds, then diffs every shared `pkghash` against the real
+`/evm-indexer` binary. The `replace` is injected into a throwaway copy, so the committed
+`go.mod` stays clean and `go test ./...` keeps working normally.
 
-To re-check the target Go release after bumping the indexer dependency:
+Overridable: `EVMI_IMAGE`, `GO_VERSION`, `INDEXER_REV`, `INDEXER_REPO`, `BUILD_PATH`, `OUT`.
+
+To check an existing `.so` against a server binary:
 
 ```bash
-go list -m -f '{{.GoVersion}}' github.com/evmi-cloud/go-evm-indexer
+docker cp <evmi-container>:/evm-indexer /tmp/evm-indexer
+docker run --rm -v /tmp:/w -v "$PWD":/p golang:1.24.13-bookworm \
+  bash /p/verify-plugin.sh /w/evm-indexer /p/clear-defi.so
 ```
 
-(Or let EVMI build it from source: install a `Plugin` pointing at this git repo / path.)
+Install the result by placing it in the server's plugins directory (the volume mounted at
+`/evmi/plugins`, named after the EVMI `Plugin` record, e.g. `Clear.so`) and restarting.
+
+> **Do not let EVMI install this plugin from git.** When the `.so` is missing, the server
+> clones `GitUrl` and runs `go build -buildmode=plugin` itself — that build resolves the
+> indexer from the module cache, not `/app`, so it always produces a `.so` the same
+> server cannot load. Ship the prebuilt `.so` into the volume instead. (The durable
+> upstream fix is for the indexer image to keep its source at `/app` in the final stage,
+> so the runtime build can `replace` onto it.)
+
+Linux `.so` only, and `CGO_ENABLED=1` is required.
 
 ## Configure in EVMI
 

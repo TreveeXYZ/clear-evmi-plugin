@@ -298,7 +298,7 @@ CREATE TABLE IF NOT EXISTS clear_reserve_value_history (
 -- reserve/base_pool/coin/is_base_pool/deployer come from the ClearCurvePoolDeployer's
 -- PoolDeployed event and stay NULL for a pool indexed from its own logs only.
 -- is_base_pool marks the reserve's plain base pool (PoolDeployed carries coin = 0
--- and pool == base_pool there); otherwise the pool is a metapool pairing `coin` —
+-- and pool == base_pool there); otherwise the pool is a metapool pairing "coin" —
 -- an asset's IOU, or a meta reserve's native token / native IOU — against base_pool.
 CREATE TABLE IF NOT EXISTS clear_curve_pools (
     chain_id     BIGINT NOT NULL,

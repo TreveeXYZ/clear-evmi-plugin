@@ -13,10 +13,11 @@
   },
   "plugins": [
     {
+      "_comment": "EVMI clones gitUrl at gitRef and runs `go build` on the REPO ROOT (the plugin's main package must live there), then runs the resulting executable as a subprocess and talks to it over gRPC. gitRef is optional (empty = the repo's default branch).",
       "name": "clear-defi",
       "description": "Clear protocol exporter (reserves, IOUs, curve pools)",
-      "gitUrl": "https://github.com/<your-org>/clear-defi-exporter",
-      "relativePath": "."
+      "gitUrl": "https://github.com/<your-org>/clear-evmi-plugin",
+      "gitRef": ""
     }
   ],
   "resources": {

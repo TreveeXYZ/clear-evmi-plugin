@@ -38,62 +38,32 @@ Amounts are `NUMERIC` (uint256-safe); addresses are stored lowercased.
 
 ## Build
 
-A Go plugin loads **only** if, for every package it shares with the host, an 8-byte
-`pkghash` is identical — otherwise `plugin.Open` fails with
-`plugin was built with a different version of package …`. That hash depends on three
-things, all of which must match the EVMI server binary:
-
-1. **the Go release** — `go.mod`'s `go` directive is only a *minimum*; the published
-   image is built with a later patch release (go.mod says 1.24.9, the image uses
-   go1.24.13);
-2. **every shared dependency version** — `go.mod` must resolve exactly what the server
-   linked (notably `github.com/lib/pq v1.10.9`; don't let `go get -u` bump it), and the
-   `go-evm-indexer` pseudo-version must be the **commit the image was built from**;
-3. **the absolute path the indexer source was compiled from** — the indexer builds
-   without `-trimpath` from `WORKDIR /app`, so `/app/pkg/exporter/…` is baked into the
-   hash. A plugin that pulls the indexer from the module cache compiles the *same source*
-   at `/go/pkg/mod/…@v…/pkg/exporter` and gets a **different** hash.
-
-(3) is the one that bites, and it is why `go build -buildmode=plugin` alone is not
-enough — including the build EVMI itself runs when it clones the repo and compiles it
-in-container. `-trimpath` does not fix it either: a trimpath'd host and a trimpath'd
-plugin still disagree, because one compiles the package as the main module and the other
-as a dependency. Matching the path is what works.
-
-`build.sh` does all of it, and refuses to emit a `.so` that would not load:
+EVMI runs an exporter plugin as a **subprocess** and talks to it over gRPC
+([hashicorp/go-plugin](https://github.com/hashicorp/go-plugin)), so this is an ordinary Go
+program — no `-buildmode=plugin`, no matching the server's toolchain or dependency
+versions, and a panic here takes down only this process:
 
 ```bash
-./build.sh            # -> clear-defi.so, verified against the real server binary
+go build -o clear-defi .
 ```
 
-It reads the target Go release and indexer commit **off the EVMI image itself**
-(`org.opencontainers.image.revision` + the binary's stamp), checks that commit out at
-`/app` inside a `golang:<release>-bookworm` container, points the plugin's `go.mod` there
-with a `replace`, builds, then diffs every shared `pkghash` against the real
-`/evm-indexer` binary. The `replace` is injected into a throwaway copy, so the committed
-`go.mod` stays clean and `go test ./...` keeps working normally.
+The repo root **is** the build target: EVMI clones the repository and runs `go build` on
+it, so the `main` package must stay at the root (it does — `main.go` calls
+`exporter.Serve`). In practice you never build by hand: point EVMI at the git URL and let
+it install (below).
 
-Overridable: `EVMI_IMAGE`, `GO_VERSION`, `INDEXER_REV`, `INDEXER_REPO`, `BUILD_PATH`, `OUT`.
+Two rules the plugin has to keep holding to:
 
-To check an existing `.so` against a server binary:
+- **Nothing on stdout.** Stdout carries the go-plugin handshake and the gRPC stream;
+  writing to it corrupts the connection. `Init` logs via the standard library `log`
+  package, which goes to **stderr** — EVMI captures that and folds it into its own log.
+- **Idempotent on `LogEvent.Id`.** Delivery is at-least-once; the `clear_processed_events`
+  ledger claims each id inside the same transaction as the writes, so a replayed log is a
+  no-op (see `NewLogEvent` in `main.go`).
 
-```bash
-docker cp <evmi-container>:/evm-indexer /tmp/evm-indexer
-docker run --rm -v /tmp:/w -v "$PWD":/p golang:1.24.13-bookworm \
-  bash /p/verify-plugin.sh /w/evm-indexer /p/clear-defi.so
-```
-
-Install the result by placing it in the server's plugins directory (the volume mounted at
-`/evmi/plugins`, named after the EVMI `Plugin` record, e.g. `Clear.so`) and restarting.
-
-> **Do not let EVMI install this plugin from git.** When the `.so` is missing, the server
-> clones `GitUrl` and runs `go build -buildmode=plugin` itself — that build resolves the
-> indexer from the module cache, not `/app`, so it always produces a `.so` the same
-> server cannot load. Ship the prebuilt `.so` into the volume instead. (The durable
-> upstream fix is for the indexer image to keep its source at `/app` in the final stage,
-> so the runtime build can `replace` onto it.)
-
-Linux `.so` only, and `CGO_ENABLED=1` is required.
+The only compatibility constraint left is the SDK protocol version: EVMI rejects a plugin
+built against an incompatible `pkg/exporter` at handshake time, naming the mismatch. If
+that happens, `go get -u github.com/evmi-cloud/go-evm-indexer` and reinstall.
 
 ## Configure in EVMI
 
@@ -116,7 +86,12 @@ Linux `.so` only, and `CGO_ENABLED=1` is required.
    (base and meta reserves) and a factory source spawns only one — so each reserve needs its own
    source entry, though the exporter still registers it in `clear_contracts` from
    `NewClearReserve`. All sources must be in the **same pipeline** the exporter reads.
-4. **Plugin** — install this plugin (`InstallPlugin`).
+4. **Plugin** — create a `Plugin` record with `GitUrl` = this repository (and optionally
+   `GitRef` = a branch or tag), then **Install** it: EVMI clones the repo, runs `go build`
+   on its root, stores the executable, and runs it once to read `ConfigSchema()` — which is
+   what makes the exporter form typed and validates `pluginConfig` on save. The build runs
+   on the EVMI instance, so it needs network access to fetch this module's dependencies.
+   Editing the source resets the plugin to `NOT_INSTALLED`; reinstall to rebuild.
 5. **Exporter** — create an `EvmiExporter` bound to the pipeline with config:
 
    ```json
@@ -148,11 +123,12 @@ server config and every resource below is created on startup if absent (idempote
   `CurveStableSwapNG` child source (`PoolDeployed` / `pool`);
 - the **`ClearReserveFactory`**, both oracle contracts and any externally-deployed Curve pool as
   plain `CONTRACT` sources;
-- the plugin itself (via `plugins`, from your git repo).
+- the plugin itself (via `plugins`: `gitUrl` + optional `gitRef`) — the server clones and
+  builds it on startup, then keeps it installed.
 
 **Replace the placeholders first** (they're marked with `0x…`/`<...>`): the RPC URL and key, the
 reserve/pool addresses, each source's `startBlock` (set to the deployment block for exact
-balances), the metadata + exporter Postgres DSNs, and the plugin `gitUrl`. Then:
+balances), the metadata + exporter Postgres DSNs, and the plugin `gitUrl`/`gitRef`. Then:
 
 ```bash
 go run ./cmd/evm-indexer start --config examples/exporters/clear-defi/autoload.config.json --instance evmi-1

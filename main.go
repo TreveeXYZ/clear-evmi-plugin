@@ -22,15 +22,22 @@
 // first time) are registered dynamically and persisted, so the registry grows as
 // the protocol does and is restored on restart. See registry.go / dispatch.go.
 //
-// Build (with the SAME toolchain/module versions as the evmi server):
+// The plugin is an ordinary Go program: EVMI launches it as a SUBPROCESS and
+// talks to it over gRPC (hashicorp/go-plugin), so it is built with a plain
+// `go build` and its toolchain / dependency versions are its own business.
 //
-//	go build -buildmode=plugin -o clear-defi.so ./examples/exporters/clear-defi
+//	go build -o clear-defi .
+//
+// NEVER write to stdout: stdout carries the go-plugin handshake and the gRPC
+// stream. Log to stderr (the standard library `log` package already does) —
+// EVMI captures it and forwards it to its own log.
 package main
 
 import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 
 	exporter "github.com/evmi-cloud/go-evm-indexer/pkg/exporter"
@@ -66,8 +73,16 @@ type clearExporter struct {
 	registry map[string]contractKind
 }
 
+var (
+	_ exporter.Exporter     = (*clearExporter)(nil)
+	_ exporter.Configurable = (*clearExporter)(nil)
+)
+
 func (e *clearExporter) Name() string { return "clear-defi" }
 
+// ConfigSchema implements the optional exporter.Configurable interface: EVMI
+// extracts it once at install time (by running this binary) and validates every
+// exporter's pluginConfig against it before starting.
 func (e *clearExporter) ConfigSchema() []exporter.ConfigField {
 	return []exporter.ConfigField{
 		{
@@ -129,7 +144,8 @@ func (e *clearExporter) Init(ctx exporter.Context) error {
 		return fmt.Errorf("load registry: %w", err)
 	}
 
-	fmt.Printf("[%s] init pipeline=%d chain=%d contracts=%d\n", e.name, ctx.PipelineId, ctx.ChainId, len(e.registry))
+	// stderr: stdout carries the go-plugin handshake and the gRPC stream.
+	log.Printf("[%s] init pipeline=%d chain=%d contracts=%d", e.name, ctx.PipelineId, ctx.ChainId, len(e.registry))
 	return nil
 }
 
@@ -179,8 +195,7 @@ func (e *clearExporter) Close() error {
 	return nil
 }
 
-// New is the symbol the EVMI server looks up to instantiate the plugin.
-func New() exporter.Exporter { return &clearExporter{} }
-
-// main is required for -buildmode=plugin but never executed.
-func main() {}
+// main hands the exporter to the SDK's go-plugin server. Serve blocks until EVMI
+// closes the connection (exporter stopped / server shutdown), then returns — all
+// setup belongs in Init, not here.
+func main() { exporter.Serve(&clearExporter{}) }

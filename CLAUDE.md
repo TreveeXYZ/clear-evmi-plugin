@@ -4,21 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An **EVMI exporter plugin** (Go, `package main`, built with `-buildmode=plugin`) for the **Clear DeFi protocol**. It consumes a pipeline's decoded EVM logs *in block order* and materializes protocol state into PostgreSQL. The plugin gets **no RPC access** — every table is derived purely from events. It implements the `exporter.Exporter` interface from `github.com/evmi-cloud/go-evm-indexer/pkg/exporter`; the EVMI server looks up the exported `New()` symbol to instantiate it (`main.go`). `func main()` exists only because `-buildmode=plugin` requires it and is never run.
+An **EVMI exporter plugin** for the **Clear DeFi protocol** — an ordinary Go program (`package main`, plain `go build`), not a `-buildmode=plugin` shared object. EVMI launches it as a **subprocess** and calls it over gRPC via [hashicorp/go-plugin](https://github.com/hashicorp/go-plugin), so its toolchain and dependency versions are its own business and a panic here kills only this process. It consumes a pipeline's decoded EVM logs *in block order* and materializes protocol state into PostgreSQL. The plugin gets **no RPC access** — every table is derived purely from events.
+
+It implements `exporter.Exporter` (`Name`/`Init`/`NewLogEvent`/`Close`) plus the optional `exporter.Configurable` (`ConfigSchema`, which EVMI extracts at install time by running the binary once, and validates each exporter's `pluginConfig` against) from `github.com/evmi-cloud/go-evm-indexer/pkg/exporter`; `func main()` hands the implementation to `exporter.Serve`, which blocks until EVMI disconnects. Two constraints follow from the subprocess model: the `main` package must live at the **repo root** (that is the path EVMI clones and builds), and **nothing may be written to stdout** — stdout is the handshake/gRPC channel, so all logging goes to stderr via the standard library `log` package (EVMI captures it into its own log).
 
 ## Commands
 
 ```bash
-# Build the .so. NOT a plain `go build`: plugin.Open compares a pkghash per shared
-# package, which depends on (1) the Go release the SERVER was built with (go.mod's `go`
-# directive is only a minimum — the image uses go1.24.13), (2) every shared dep version
-# (lib/pq v1.10.9; go-evm-indexer pinned to the image's commit), and (3) the absolute
-# path the indexer was compiled from (/app, no -trimpath). build.sh reads (1) and the
-# indexer commit off the EVMI image, checks that commit out at /app in a container,
-# `replace`s go.mod onto it, builds, and diffs every shared pkghash against the real
-# /evm-indexer binary — refusing to emit a .so that would fail plugin.Open. Linux only.
-./build.sh                              # -> clear-defi.so (auto-detects everything)
-EVMI_IMAGE=... GO_VERSION=... ./build.sh # override if the server image differs
+# Plain go build — the repo root is the build target EVMI itself uses.
+go build -o clear-defi .
 
 go vet ./...
 go test ./...                    # unit tests only (classify/neg/firstArg/... in helpers_test.go)
@@ -28,9 +22,13 @@ go test ./... -run TestClassify  # a single test
 # SQLite won't do). It DROPs all clear_* tables first, so point it at a scratch DB.
 CLEAR_DEFI_POSTGRES_DSN='postgres://evmi:evmi@localhost:5432/evmi?sslmode=disable' \
   go test ./... -run TestReplayProtocol -v
+
+# Bump the SDK (the one compatibility surface left: EVMI rejects a plugin built against an
+# incompatible protocol version at handshake, naming the mismatch).
+go get -u github.com/evmi-cloud/go-evm-indexer && go mod tidy
 ```
 
-`autoload.config.json` wires the entire EVMI deployment declaratively (ABIs, blockchain, log store, pipeline, sources, plugin, exporter) — see README for the placeholders to replace before use.
+`autoload.config.json` wires the entire EVMI deployment declaratively (ABIs, blockchain, log store, pipeline, sources, plugin, exporter). Its `plugins` entry is `{name, description, gitUrl, gitRef}` — git is the only supported source and the build target is always the repo root, so there is no package path to configure. See README for the placeholders to replace before use.
 
 ## Architecture and invariants
 

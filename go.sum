@@ -3,8 +3,8 @@ github.com/bufbuild/protocompile v0.4.0/go.mod h1:3v93+mbWn/v3xzN+31nwkJfrEpAUwp
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc h1:U9qPSI2PIWSS1VwoXQT9A3Wy9MM3WgvqSxFWenqJduM=
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/evmi-cloud/go-evm-indexer v0.0.0-20260823080812-9cfc86a02ff1 h1:RRFoFeYycH4s3Aef47NBALTCH1pq6sRfbdHmsAYkfNo=
-github.com/evmi-cloud/go-evm-indexer v0.0.0-20260823080812-9cfc86a02ff1/go.mod h1:7Lee3PHL0I00YbLXzC36MI4zacoEgGv5PIMVG1ozr9Q=
+github.com/evmi-cloud/go-evm-indexer v0.0.0-20260823092941-08adb0f65061 h1:emw0lAxPe5fSMmZbqGmAW3OHW+icFE8rd2eQQhtVl6I=
+github.com/evmi-cloud/go-evm-indexer v0.0.0-20260823092941-08adb0f65061/go.mod h1:7Lee3PHL0I00YbLXzC36MI4zacoEgGv5PIMVG1ozr9Q=
 github.com/fatih/color v1.7.0/go.mod h1:Zm6kSWBoL9eyXnKyktHP6abPY2pDugNf5KwzbycvMj4=
 github.com/fatih/color v1.16.0 h1:zmkK9Ngbjj+K0yRhTVONQh1p/HknKYSlNT+vZCzyokM=
 github.com/fatih/color v1.16.0/go.mod h1:fL2Sau1YI5c0pdGEVCbKQbLXB6edEj1ZgiY4NijnWvE=

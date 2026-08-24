@@ -24,7 +24,11 @@ CLEAR_DEFI_POSTGRES_DSN='postgres://evmi:evmi@localhost:5432/evmi?sslmode=disabl
   go test ./... -run TestReplayProtocol -v
 
 # Bump the SDK (the one compatibility surface left: EVMI rejects a plugin built against an
-# incompatible protocol version at handshake, naming the mismatch).
+# incompatible protocol version at handshake, naming the mismatch). NOTE the indexer's
+# release tags are `0.3.0`, not `v0.3.0` — not valid Go module versions, so `go list -m
+# -versions` shows none of them and `@0.3.0` does not resolve. Map the release to its
+# commit and pin the pseudo-version:
+#   git ls-remote --tags --refs https://github.com/evmi-cloud/go-evm-indexer.git
 go get -u github.com/evmi-cloud/go-evm-indexer && go mod tidy
 ```
 
@@ -39,6 +43,8 @@ The whole pipeline is small (`main.go`, `registry.go`, `dispatch.go`, `schema.go
 **Discovery events register contracts eagerly**, each inside the handling tx: `dispatchReserve` calls `trackContract(iou, iouKind)` on `AssetAdded` (both reserve types spawn IOUs); `handleNewClearReserve` registers the reserve the `ClearReserveFactory` announces, with the kind from its `reserveType` enum; `handlePoolDeployed` registers the pool the `ClearCurvePoolDeployer` announces. `clear_contracts` (PK `(chain_id, address)`) is the source of truth; source ABIs still need sensible names for the first-sight fallback, and a new contract type means extending `classify()` **and** `kindFromString`/`contractKind.String()`. Untracked addresses are ignored (their event id is still marked processed).
 
 Registering an address only fixes its **routing** — evmi still has to deliver its logs, which needs a pipeline source for it. `autoload.config.json` runs each reserve and the pool deployer as `FACTORY` sources so their children are auto-sourced; the `ClearReserveFactory` can't be one (a factory source spawns a single child ABI, and it deploys both reserve types), so reserves need their own source entries.
+
+> **Not currently used: the host API (SDK ≥ 0.3.0).** `Context.Host` is a reverse channel from the plugin back into EVMI — `Blockchain()` (chain info + the `RpcUrl` the indexer polls), `CreateLogSource()` (register a contract to index as a child of an existing source, idempotent per `(Parent, Address)`), and `UpsertAbi`/`GetAbi`/`GetAbiByID`/`ListAbis`. It is nil on older servers, so any use needs a fallback. Two things it would unlock if wanted later: (a) `handleNewClearReserve` already resolves the reserve address *and* its base/meta kind, so it could `CreateLogSource` the reserve itself (parent = `log.SourceId`, ABI per kind) and retire the hand-written per-reserve source entries in `autoload.config.json` — the exact gap the two-child-ABI problem above leaves open; (b) "no RPC access" would become a choice rather than a constraint, which is worth revisiting against the meta-reserve balance-tracking limitation below. Deliberately not done: the plugin works unchanged on 0.3.0 and stays server-version-agnostic.
 
 **2. Exactly-once via a processed-events ledger.** EVMI delivery is at-least-once. `NewLogEvent` (`main.go`) opens a transaction, does `INSERT INTO clear_processed_events (id) ... ON CONFLICT DO NOTHING`, and if the row already existed (RowsAffected == 0) it **rolls back and does nothing** — the log was already applied. Only new ids reach `dispatch()`. This is what keeps balance arithmetic (which is *additive*, `balance = balance + delta`) from double-counting on a restart/redelivery. Every handler runs inside this one transaction (`tx`); never open a second DB connection or commit mid-handler. The `id` is evmi's stable `chainId:block:logIndex`.
 

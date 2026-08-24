@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -110,13 +111,74 @@ func neg(v string) string {
 	return "-" + v
 }
 
-// jsonArg wraps a JSON-array arg (e.g. Curve token_amounts) for a JSONB column,
-// NULL when absent.
-func jsonArg(args map[string]string, key string) sql.NullString {
-	if v, ok := args[key]; ok && v != "" {
-		return sql.NullString{String: v, Valid: true}
+// splitArrayArg decodes an array ABI argument (uint256[], address[]) into its
+// elements. Two renderings have to be accepted, because which one arrives depends
+// on the server version:
+//
+//   - a real JSON array — `["1","2"]` or `[1,2]` — from a server that serializes
+//     array args;
+//   - Go's fmt.Sprint form — `[1 2]`, `[0xAbC… 0xDeF…]` — from a server whose
+//     formatArgValue has no slice case and falls through to fmt.Sprint. This is
+//     NOT JSON: handing it to a JSONB column fails with "invalid input syntax for
+//     type json", and json.Unmarshal on it fails outright.
+//
+// Numbers keep their literal text rather than going through float64, so a uint256
+// survives intact.
+func splitArrayArg(s string) ([]string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
 	}
-	return sql.NullString{}
+	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+		return nil, fmt.Errorf("not an array arg: %q", s)
+	}
+
+	// JSON first — `["1","2"]` must not be split on whitespace.
+	var raw []json.RawMessage
+	if err := json.Unmarshal([]byte(s), &raw); err == nil {
+		out := make([]string, 0, len(raw))
+		for _, el := range raw {
+			var str string
+			if err := json.Unmarshal(el, &str); err == nil {
+				out = append(out, str)
+				continue
+			}
+			// A number or bool: keep the literal token (uint256-safe).
+			out = append(out, string(el))
+		}
+		return out, nil
+	}
+
+	// fmt.Sprint form: unquoted elements separated by whitespace.
+	inner := strings.TrimSpace(s[1 : len(s)-1])
+	if inner == "" {
+		return nil, nil
+	}
+	return strings.Fields(inner), nil
+}
+
+// jsonArrayArg wraps an array ABI arg for a JSONB column, NULL when absent. It
+// normalizes whichever rendering the server used into a JSON array of strings —
+// strings so a uint256 keeps full precision through the column. lower lowercases
+// each element (for address[], to match every other stored address).
+func jsonArrayArg(args map[string]string, key string, lower bool) (sql.NullString, error) {
+	els, err := splitArrayArg(args[key])
+	if err != nil {
+		return sql.NullString{}, fmt.Errorf("%s: %w", key, err)
+	}
+	if els == nil {
+		return sql.NullString{}, nil
+	}
+	if lower {
+		for i := range els {
+			els[i] = strings.ToLower(els[i])
+		}
+	}
+	encoded, err := json.Marshal(els)
+	if err != nil {
+		return sql.NullString{}, fmt.Errorf("%s: %w", key, err)
+	}
+	return sql.NullString{String: string(encoded), Valid: true}, nil
 }
 
 // adjustBalance upserts a per-holder balance by delta (a signed decimal string).

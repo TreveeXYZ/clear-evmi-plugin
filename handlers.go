@@ -2,7 +2,6 @@ package main
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -150,17 +149,16 @@ func reserveAssetsByPosition(tx *sql.Tx, chainID uint64, reserve string) (map[in
 }
 
 // applyReserveAmounts adjusts each underlying-token balance from a Deposit/Withdraw
-// `amounts` array (evmi serializes uint256[] as a JSON array of decimal strings),
-// aligned with assetList order. `negate` flips the sign for withdrawals. An index
-// whose asset is unknown (AssetAdded missed because indexing started late) is
-// skipped — its balance would be wrong anyway.
-func applyReserveAmounts(tx *sql.Tx, chainID uint64, reserve, amountsJSON string, negate bool, block uint64) error {
-	if amountsJSON == "" {
-		return nil
+// `amounts` array, aligned with assetList order. `negate` flips the sign for
+// withdrawals. An index whose asset is unknown (AssetAdded missed because indexing
+// started late) is skipped — its balance would be wrong anyway.
+func applyReserveAmounts(tx *sql.Tx, chainID uint64, reserve, amountsArg string, negate bool, block uint64) error {
+	amounts, err := splitArrayArg(amountsArg)
+	if err != nil {
+		return fmt.Errorf("amounts array: %w", err)
 	}
-	var amounts []string
-	if err := json.Unmarshal([]byte(amountsJSON), &amounts); err != nil {
-		return fmt.Errorf("amounts array %q: %w", amountsJSON, err)
+	if len(amounts) == 0 {
+		return nil
 	}
 	byPos, err := reserveAssetsByPosition(tx, chainID, reserve)
 	if err != nil {
@@ -493,6 +491,14 @@ func handleCurveLiquidity(tx *sql.Tx, log exporter.LogEvent, kind string) error 
 	if err := ensureCurve(tx, log.ChainId, pool, log.BlockNumber); err != nil {
 		return err
 	}
+	tokenAmounts, err := jsonArrayArg(a, "token_amounts", false)
+	if err != nil {
+		return err
+	}
+	fees, err := jsonArrayArg(a, "fees", false)
+	if err != nil {
+		return err
+	}
 	return exec(tx, `INSERT INTO clear_curve_liquidity
 (id, chain_id, pool, block_number, log_index, tx_hash, provider, kind,
  token_amounts, fees, token_id, token_amount, coin_amount, invariant, token_supply)
@@ -500,7 +506,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 ON CONFLICT (id) DO NOTHING`,
 		log.Id, log.ChainId, pool, log.BlockNumber, log.LogIndex, log.TransactionHash,
 		normAddr(a["provider"]), kind,
-		jsonArg(a, "token_amounts"), jsonArg(a, "fees"),
+		tokenAmounts, fees,
 		nullNum(a, "token_id"), nullNum(a, "token_amount"), nullNum(a, "coin_amount"),
 		nullNum(a, "invariant"), nullNum(a, "token_supply"))
 }
@@ -715,11 +721,12 @@ func (e *clearExporter) handleNewClearReserve(tx *sql.Tx, log exporter.LogEvent)
 	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
 	}
-	// `tokens` is an address[]; evmi serializes it as a JSON array of strings, which
-	// goes into JSONB as-is (lowercased to match every other stored address).
-	tokens := jsonArg(a, "tokens")
-	if tokens.Valid {
-		tokens.String = strings.ToLower(tokens.String)
+	// `tokens` is an address[]; jsonArrayArg normalizes whichever rendering the
+	// server used into a JSON array for the JSONB column, lowercased to match every
+	// other stored address.
+	tokens, err := jsonArrayArg(a, "tokens", true)
+	if err != nil {
+		return err
 	}
 	if err := exec(tx, `UPDATE clear_reserves
 SET name = $3, symbol = $4, implementation = $5, reserve_index = $6, tokens = $7, factory = $8

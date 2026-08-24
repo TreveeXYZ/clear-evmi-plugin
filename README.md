@@ -103,8 +103,9 @@ that happens, `go get -u github.com/evmi-cloud/go-evm-indexer` and reinstall.
 
    Start it; it processes the pipeline's logs in block order and fills the tables.
 
-> The `uint256[]` args on Curve liquidity events require an EVMI server that serializes array
-> ABI args (added alongside this example); older servers panic on them.
+> Array ABI args (`amounts[]`, `token_amounts`/`fees`, `tokens[]`) arrive in one of two
+> renderings depending on the server version — a JSON array, or Go's `fmt.Sprint` form
+> (`[1 2]`, which is *not* JSON). Both are accepted; see `splitArrayArg` in `db.go`.
 
 ## One-shot setup with the autoloader
 

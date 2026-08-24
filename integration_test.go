@@ -160,7 +160,8 @@ func TestReplayProtocol(t *testing.T) {
 		mkLog(100, 3, R, reserve, "Deposit", map[string]string{"caller": alice, "receiver": alice, "lpMinted": "1000", "amounts": `["1000","1000"]`}),
 		// Bob deposit: 500 LP, 500 usdc + 500 usdt in.
 		mkLog(101, 0, R, reserve, "Transfer", map[string]string{"from": zeroAddr, "to": bob, "value": "500"}),
-		mkLog(101, 1, R, reserve, "Deposit", map[string]string{"caller": bob, "receiver": bob, "lpMinted": "500", "amounts": `["500","500"]`}),
+		// fmt.Sprint rendering of amounts[]; the JSON form is exercised above.
+		mkLog(101, 1, R, reserve, "Deposit", map[string]string{"caller": bob, "receiver": bob, "lpMinted": "500", "amounts": "[500 500]"}),
 		// Alice sends 200 LP to Bob (no supply / token change).
 		mkLog(102, 0, R, reserve, "Transfer", map[string]string{"from": alice, "to": bob, "value": "200"}),
 		// Carol depeg swap: 100 usdc in, 95 usdt out, 5 IOU shortfall.
@@ -183,7 +184,7 @@ func TestReplayProtocol(t *testing.T) {
 		// Curve (Vyper) uses sender/receiver on Transfer.
 		mkLog(104, 0, CURVE, pool, "Transfer", map[string]string{"sender": zeroAddr, "receiver": dave, "value": "1000"}),
 		mkLog(104, 1, CURVE, pool, "AddLiquidity", map[string]string{
-			"provider": dave, "token_amounts": `["500","500"]`, "fees": `["0","0"]`, "invariant": "1000", "token_supply": "1000"}),
+			"provider": dave, "token_amounts": "[500 500]", "fees": "[0 0]", "invariant": "1000", "token_supply": "1000"}),
 		mkLog(104, 2, CURVE, pool, "TokenExchange", map[string]string{
 			"buyer": eve, "sold_id": "0", "tokens_sold": "100", "bought_id": "1", "tokens_bought": "99"}),
 		mkLog(105, 0, CURVE, pool, "Transfer", map[string]string{"sender": dave, "receiver": zeroAddr, "value": "200"}),
@@ -215,7 +216,10 @@ func TestReplayProtocol(t *testing.T) {
 		mkLog(109, 1, FACTORY, factory, "NewMetaReserveImplementation", map[string]string{"version": "2", "implementation": implAddr}),
 		mkLog(109, 2, FACTORY, factory, "NewClearReserve", map[string]string{
 			"index": "1", "implementation": implAddr, "reserveType": "1", "reserve": metaReserve,
-			"name": "Clear Meta USD", "symbol": "cmUSD", "tokens": `["` + reserve + `","` + nativeTok + `"]`}),
+			// tokens[] in Go's fmt.Sprint rendering — what a server whose formatArgValue
+			// has no slice case emits. It is NOT JSON; it must still land in the JSONB
+			// column as a proper array (this is what broke live).
+			"name": "Clear Meta USD", "symbol": "cmUSD", "tokens": "[" + reserve + " " + nativeTok + "]"}),
 		// Meta AssetAdded: one per leg (native first, then BaseLP), each with the leg's
 		// IOU and its target weight in bps.
 		mkLog(109, 3, META, metaReserve, "AssetAdded", map[string]string{"asset": nativeTok, "decimals": "6", "iou": metaIou1, "weight": "2000"}),

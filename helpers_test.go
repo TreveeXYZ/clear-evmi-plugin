@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestClassify(t *testing.T) {
 	cases := map[string]contractKind{
@@ -100,5 +103,80 @@ func TestReserveKindFromType(t *testing.T) {
 		if got := reserveKindFromType(in); got != want {
 			t.Errorf("reserveKindFromType(%q) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+// TestSplitArrayArg covers both renderings an evmi server may use for an array
+// ABI arg: a real JSON array, and Go's fmt.Sprint form (what a server whose
+// formatArgValue has no slice case emits — the one that caused
+// "pq: invalid input syntax for type json" on NewClearReserve).
+func TestSplitArrayArg(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty arg", "", nil},
+		{"json strings", `["1","2"]`, []string{"1", "2"}},
+		{"json numbers keep precision", `[115792089237316195423570985008687907853269984665640564039457584007913129639935,2]`,
+			[]string{"115792089237316195423570985008687907853269984665640564039457584007913129639935", "2"}},
+		{"json empty", "[]", nil},
+		{"sprint numbers", "[1 2 3]", []string{"1", "2", "3"}},
+		{"sprint addresses", "[0xAbC0000000000000000000000000000000000001 0xdEf0000000000000000000000000000000000002]",
+			[]string{"0xAbC0000000000000000000000000000000000001", "0xdEf0000000000000000000000000000000000002"}},
+		{"sprint single", "[42]", []string{"42"}},
+		{"sprint empty", "[ ]", nil},
+	}
+	for _, c := range cases {
+		got, err := splitArrayArg(c.in)
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", c.name, err)
+			continue
+		}
+		if len(got) != len(c.want) {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%s: element %d = %q, want %q", c.name, i, got[i], c.want[i])
+			}
+		}
+	}
+
+	if _, err := splitArrayArg("not-an-array"); err == nil {
+		t.Error("a non-array arg should be rejected, not silently accepted")
+	}
+}
+
+// TestJSONArrayArg checks that whichever rendering arrives, what reaches the JSONB
+// column is valid JSON — the actual bug: the fmt.Sprint form went in verbatim.
+func TestJSONArrayArg(t *testing.T) {
+	for _, in := range []string{`["1","2"]`, "[1 2]"} {
+		got, err := jsonArrayArg(map[string]string{"amounts": in}, "amounts", false)
+		if err != nil {
+			t.Fatalf("%q: %v", in, err)
+		}
+		if !got.Valid || got.String != `["1","2"]` {
+			t.Errorf("%q -> %q, want [\"1\",\"2\"]", in, got.String)
+		}
+		var check []string
+		if err := json.Unmarshal([]byte(got.String), &check); err != nil {
+			t.Errorf("%q produced invalid JSON %q: %v", in, got.String, err)
+		}
+	}
+
+	// address[] is lowercased to match every other stored address.
+	got, err := jsonArrayArg(map[string]string{"tokens": "[0xAbC0000000000000000000000000000000000001]"}, "tokens", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.String != `["0xabc0000000000000000000000000000000000001"]` {
+		t.Errorf("tokens -> %q, want lowercased", got.String)
+	}
+
+	// Absent arg stays NULL rather than becoming an empty array.
+	if got, err := jsonArrayArg(map[string]string{}, "fees", false); err != nil || got.Valid {
+		t.Errorf("absent arg -> %+v, %v; want NULL", got, err)
 	}
 }

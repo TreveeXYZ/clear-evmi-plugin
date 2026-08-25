@@ -24,6 +24,8 @@ func (e *clearExporter) dispatch(tx *sql.Tx, log exporter.LogEvent, k contractKi
 		return e.dispatchFactory(tx, log)
 	case curveDeployerKind:
 		return e.dispatchCurveDeployer(tx, log)
+	case curveFactoryKind:
+		return e.dispatchCurveFactory(tx, log)
 	default:
 		return nil
 	}
@@ -176,6 +178,22 @@ func (e *clearExporter) dispatchFactory(tx *sql.Tx, log exporter.LogEvent) error
 func (e *clearExporter) dispatchCurveDeployer(tx *sql.Tx, log exporter.LogEvent) error {
 	if log.EventName == "PoolDeployed" {
 		return e.handlePoolDeployed(tx, log)
+	}
+	return nil
+}
+
+// dispatchCurveFactory handles CurveStableSwapFactoryNG events, which catch every
+// pool deployed through the Curve factory — the ones ClearCurvePoolDeployer built
+// and the ones it did not. Neither PlainPoolDeployed nor MetaPoolDeployed carries
+// the address of the pool it created, so the handler resolves it over RPC and
+// registers the pool as a new log source (see curve.go / host.go).
+// BasePoolAdded and LiquidityGaugeDeployed are ignored.
+func (e *clearExporter) dispatchCurveFactory(tx *sql.Tx, log exporter.LogEvent) error {
+	switch log.EventName {
+	case "PlainPoolDeployed":
+		return e.handleCurvePoolDeployed(tx, log, false)
+	case "MetaPoolDeployed":
+		return e.handleCurvePoolDeployed(tx, log, true)
 	}
 	return nil
 }

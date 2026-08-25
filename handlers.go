@@ -796,3 +796,112 @@ WHERE chain_id = $1 AND address = $2`,
 	}
 	return e.trackContract(tx, log.ChainId, pool, curveKind, log.BlockNumber)
 }
+
+// --- curve stableswap-ng factory (CurveStableSwapFactoryNG) ---
+
+// handleCurvePoolDeployed records a pool the Curve factory just created. Neither
+// PlainPoolDeployed nor MetaPoolDeployed names the new pool, so its address is
+// resolved from the deployment transaction over the chain's own RPC endpoint
+// (resolveDeployedPool), the metadata that never reaches a log is read back with
+// a handful of getters (fetchCurvePool), and the pool is registered with EVMI as
+// a child log source of the factory — which is what makes its own events (swaps,
+// liquidity, LP transfers) start being delivered to dispatchCurve.
+//
+// It writes only its own columns: a pool built by the ClearCurvePoolDeployer gets
+// PoolDeployed in the same transaction, and the reserve linkage that event carries
+// must survive whichever of the two lands second.
+//
+// Without an RPC endpoint (no host API and no rpcUrl in the config) the plugin
+// degrades to a warning: the event is still consumed, the pool simply is not
+// picked up — the pre-host-API behaviour, where pools were declared by hand.
+func (e *clearExporter) handleCurvePoolDeployed(tx *sql.Tx, log exporter.LogEvent, meta bool) error {
+	a := log.Args
+	factory := normAddr(log.Address)
+
+	if e.rpc == nil {
+		warnf("[%s] %s %s: no rpc endpoint (host api unavailable and rpcUrl unset), pool not indexed", e.name, log.EventName, log.Id)
+		return nil
+	}
+
+	// A transport error is worth retrying, so it fails the event (the tx rolls
+	// back, the processed-events claim with it, and EVMI redelivers from this
+	// block). A receipt that simply holds no candidate is not: warn and move on.
+	pool, err := resolveDeployedPool(e.rpc, factory, log.TransactionHash, log.LogIndex)
+	if err != nil {
+		return fmt.Errorf("resolve deployed pool from tx %s: %w", log.TransactionHash, err)
+	}
+	if pool == "" {
+		warnf("[%s] %s %s: no pool constructor log in tx %s, pool not indexed", e.name, log.EventName, log.Id, log.TransactionHash)
+		return nil
+	}
+
+	info := fetchCurvePool(e.rpc, factory, pool)
+	coins := info.coins
+	if len(coins) == 0 {
+		if coins, err = eventCoins(a, meta); err != nil {
+			return fmt.Errorf("%s coins: %w", log.EventName, err)
+		}
+	}
+	coinsJSON, err := jsonStrings(coins)
+	if err != nil {
+		return err
+	}
+
+	isMeta := meta
+	if info.isMeta.Valid {
+		isMeta = info.isMeta.Bool
+	}
+	var nCoins sql.NullInt64
+	if len(coins) > 0 {
+		nCoins = sql.NullInt64{Int64: int64(len(coins)), Valid: true}
+	}
+	// The amplification coefficient is spelled `A` in the Vyper event; accept the
+	// lowercase spelling too in case a hand-written ABI normalizes it.
+	amp := nullNum(a, "A")
+	if !amp.Valid {
+		amp = nullNum(a, "a")
+	}
+
+	if err := ensureCurve(tx, log.ChainId, pool, log.BlockNumber); err != nil {
+		return err
+	}
+	if err := exec(tx, `UPDATE clear_curve_pools SET
+  curve_factory  = $3,
+  is_meta        = $4,
+  amplification  = $5,
+  fee            = $6,
+  name           = COALESCE(NULLIF($7::text, ''), name),
+  symbol         = COALESCE(NULLIF($8::text, ''), symbol),
+  decimals       = COALESCE($9::smallint, decimals),
+  implementation = COALESCE(NULLIF($10::text, ''), implementation),
+  coins          = COALESCE($11::jsonb, coins),
+  n_coins        = COALESCE($12::smallint, n_coins),
+  deployer       = COALESCE(deployer, NULLIF($13::text, '')),
+  base_pool      = COALESCE(base_pool, NULLIF($14::text, '')),
+  coin           = COALESCE(coin, NULLIF($15::text, ''))
+WHERE chain_id = $1 AND address = $2`,
+		log.ChainId, pool, factory, isMeta,
+		amp, nullNum(a, "fee"),
+		info.name, info.symbol, info.decimals, info.implementation,
+		coinsJSON, nCoins,
+		normAddr(a["deployer"]), normAddr(a["base_pool"]), normAddr(a["coin"])); err != nil {
+		return err
+	}
+
+	// The coin list is fixed at deployment, so the upsert is only there to make a
+	// redelivery a no-op.
+	for i, coin := range coins {
+		if err := exec(tx, `INSERT INTO clear_curve_pool_coins (chain_id, pool, position, coin, decimals)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (chain_id, pool, position) DO UPDATE
+SET coin = EXCLUDED.coin, decimals = COALESCE(EXCLUDED.decimals, clear_curve_pool_coins.decimals)`,
+			log.ChainId, pool, i, coin, coinDecimals(info.coinDecimals, i)); err != nil {
+			return err
+		}
+	}
+
+	if err := e.trackContract(tx, log.ChainId, pool, curveKind, log.BlockNumber); err != nil {
+		return err
+	}
+	return e.registerCurvePoolSource(log, pool)
+}

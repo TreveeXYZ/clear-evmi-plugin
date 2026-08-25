@@ -31,6 +31,11 @@ const (
 	// curveDeployerKind is the ClearCurvePoolDeployer: it announces every Curve
 	// pool it deploys for a reserve (PoolDeployed).
 	curveDeployerKind
+	// curveFactoryKind is the CurveStableSwapFactoryNG: it announces every pool
+	// deployed through it (PlainPoolDeployed / MetaPoolDeployed) — including
+	// pools the ClearCurvePoolDeployer did not build — but without naming the
+	// address, which is why that path needs RPC (see curve.go).
+	curveFactoryKind
 )
 
 // classify is the first-sight fallback used when an address is not yet in the
@@ -41,6 +46,8 @@ func classify(contractName string) contractKind {
 	switch {
 	case strings.Contains(n, "oracle"):
 		return oracleKind
+	case strings.Contains(n, "factory") && (strings.Contains(n, "curve") || strings.Contains(n, "stableswap")):
+		return curveFactoryKind
 	case strings.Contains(n, "deployer"):
 		return curveDeployerKind
 	case strings.Contains(n, "factory") && strings.Contains(n, "reserve"):
@@ -177,6 +184,19 @@ func jsonArrayArg(args map[string]string, key string, lower bool) (sql.NullStrin
 	encoded, err := json.Marshal(els)
 	if err != nil {
 		return sql.NullString{}, fmt.Errorf("%s: %w", key, err)
+	}
+	return sql.NullString{String: string(encoded), Valid: true}, nil
+}
+
+// jsonStrings renders a list the plugin built itself (rather than one read out of
+// an ABI arg) for a JSONB column, NULL when empty.
+func jsonStrings(values []string) (sql.NullString, error) {
+	if len(values) == 0 {
+		return sql.NullString{}, nil
+	}
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return sql.NullString{}, err
 	}
 	return sql.NullString{String: string(encoded), Valid: true}, nil
 }

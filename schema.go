@@ -32,10 +32,11 @@ CREATE TABLE IF NOT EXISTS clear_processed_events (
 -- (source='config') and extended at runtime whenever a new contract is detected —
 -- a reserve-spawned IOU at AssetAdded, a reserve announced by the
 -- ClearReserveFactory (NewClearReserve), a Curve pool announced by the
--- ClearCurvePoolDeployer (PoolDeployed), or any address seen for the first time
--- (source='dynamic'). Reloaded into the in-memory registry on start so discovery
--- survives restarts. kind is one of: base_reserve, meta_reserve, iou, curve,
--- oracle, factory, curve_deployer.
+-- ClearCurvePoolDeployer (PoolDeployed), a pool resolved off a Curve factory
+-- deployment (PlainPoolDeployed / MetaPoolDeployed), or any address seen for the
+-- first time (source='dynamic'). Reloaded into the in-memory registry on start so
+-- discovery survives restarts. kind is one of: base_reserve, meta_reserve, iou,
+-- curve, oracle, factory, curve_deployer, curve_factory.
 CREATE TABLE IF NOT EXISTS clear_contracts (
     chain_id    BIGINT NOT NULL,
     address     TEXT NOT NULL,
@@ -319,7 +320,38 @@ ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS base_pool TEXT;
 ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS coin TEXT;
 ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS is_base_pool BOOLEAN;
 ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS deployer TEXT;
+-- curve_factory/name/symbol/decimals/amplification/fee/implementation/is_meta/
+-- coins/n_coins come from the CurveStableSwapFactoryNG deployment events
+-- (PlainPoolDeployed / MetaPoolDeployed) plus the getters read back over RPC when
+-- the pool address is resolved; they stay NULL for a pool indexed from its own
+-- logs only. is_meta is the Curve classification (a metapool pairs one coin
+-- against a base pool's LP) and is NOT is_base_pool, which marks the plain pool a
+-- Clear reserve uses as its base.
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS curve_factory TEXT;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS name TEXT;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS symbol TEXT;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS decimals SMALLINT;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS amplification NUMERIC;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS fee NUMERIC;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS implementation TEXT;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS is_meta BOOLEAN;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS coins JSONB;
+ALTER TABLE clear_curve_pools ADD COLUMN IF NOT EXISTS n_coins SMALLINT;
 CREATE INDEX IF NOT EXISTS clear_curve_pools_reserve ON clear_curve_pools (chain_id, reserve);
+
+-- A pool's coins, one row per slot, in the pool's own coin order (position 0 is
+-- coins[0]) — the ordering TokenExchange's sold_id/bought_id index into. Written
+-- when the factory announces the deployment; decimals come from the factory's
+-- registry view and are NULL when that getter could not be read.
+CREATE TABLE IF NOT EXISTS clear_curve_pool_coins (
+    chain_id BIGINT NOT NULL,
+    pool     TEXT NOT NULL,
+    position INT NOT NULL,
+    coin     TEXT NOT NULL,
+    decimals SMALLINT,
+    PRIMARY KEY (chain_id, pool, position)
+);
+CREATE INDEX IF NOT EXISTS clear_curve_pool_coins_coin ON clear_curve_pool_coins (chain_id, coin);
 CREATE TABLE IF NOT EXISTS clear_curve_lp_balances (
     chain_id   BIGINT NOT NULL,
     pool       TEXT NOT NULL,

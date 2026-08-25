@@ -73,8 +73,10 @@ func TestClassifyDiscoveryContracts(t *testing.T) {
 		"ClearReserveFactory":    factoryKind,
 		"clearreservefactory":    factoryKind,
 		"ClearCurvePoolDeployer": curveDeployerKind,
-		// The Curve factory is not a Clear reserve factory: it stays a curve contract.
-		"CurveStableSwapFactoryNG": curveKind,
+		// The Curve factory is not a Clear reserve factory, and not a pool either:
+		// it is the contract whose deployment events pools are discovered from.
+		"CurveStableSwapFactoryNG": curveFactoryKind,
+		"CurveStableSwapNG":        curveKind,
 	}
 	for name, want := range cases {
 		if got := classify(name); got != want {
@@ -84,7 +86,7 @@ func TestClassifyDiscoveryContracts(t *testing.T) {
 }
 
 func TestKindRoundTrip(t *testing.T) {
-	for _, k := range []contractKind{baseReserveKind, metaReserveKind, iouKind, curveKind, oracleKind, factoryKind, curveDeployerKind} {
+	for _, k := range []contractKind{baseReserveKind, metaReserveKind, iouKind, curveKind, oracleKind, factoryKind, curveDeployerKind, curveFactoryKind} {
 		if got := kindFromString(k.String()); got != k {
 			t.Errorf("kindFromString(%q) = %d, want %d", k.String(), got, k)
 		}

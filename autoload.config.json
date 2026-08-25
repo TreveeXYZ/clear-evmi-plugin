@@ -58,6 +58,11 @@
         "content": "[{\"type\":\"event\",\"name\":\"Transfer\",\"anonymous\":false,\"inputs\":[{\"name\":\"sender\",\"type\":\"address\",\"indexed\":true},{\"name\":\"receiver\",\"type\":\"address\",\"indexed\":true},{\"name\":\"value\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"TokenExchange\",\"anonymous\":false,\"inputs\":[{\"name\":\"buyer\",\"type\":\"address\",\"indexed\":true},{\"name\":\"sold_id\",\"type\":\"int128\",\"indexed\":false},{\"name\":\"tokens_sold\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"bought_id\",\"type\":\"int128\",\"indexed\":false},{\"name\":\"tokens_bought\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"TokenExchangeUnderlying\",\"anonymous\":false,\"inputs\":[{\"name\":\"buyer\",\"type\":\"address\",\"indexed\":true},{\"name\":\"sold_id\",\"type\":\"int128\",\"indexed\":false},{\"name\":\"tokens_sold\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"bought_id\",\"type\":\"int128\",\"indexed\":false},{\"name\":\"tokens_bought\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"AddLiquidity\",\"anonymous\":false,\"inputs\":[{\"name\":\"provider\",\"type\":\"address\",\"indexed\":true},{\"name\":\"token_amounts\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"fees\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"invariant\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"token_supply\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"RemoveLiquidity\",\"anonymous\":false,\"inputs\":[{\"name\":\"provider\",\"type\":\"address\",\"indexed\":true},{\"name\":\"token_amounts\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"fees\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"token_supply\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"RemoveLiquidityOne\",\"anonymous\":false,\"inputs\":[{\"name\":\"provider\",\"type\":\"address\",\"indexed\":true},{\"name\":\"token_id\",\"type\":\"int128\",\"indexed\":false},{\"name\":\"token_amount\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"coin_amount\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"token_supply\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"RemoveLiquidityImbalance\",\"anonymous\":false,\"inputs\":[{\"name\":\"provider\",\"type\":\"address\",\"indexed\":true},{\"name\":\"token_amounts\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"fees\",\"type\":\"uint256[]\",\"indexed\":false},{\"name\":\"invariant\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"token_supply\",\"type\":\"uint256\",\"indexed\":false}]}]"
       },
       {
+        "_comment": "Curve's own StableSwap-NG factory. PlainPoolDeployed/MetaPoolDeployed announce every pool deployed through it — including pools the ClearCurvePoolDeployer did not build — but neither event names the pool it created, so the exporter resolves the address over RPC and registers the pool as a log source itself (Host.CreateLogSource).",
+        "contractName": "CurveStableSwapFactoryNG",
+        "content": "[{\"type\":\"event\",\"name\":\"BasePoolAdded\",\"anonymous\":false,\"inputs\":[{\"name\":\"base_pool\",\"type\":\"address\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"PlainPoolDeployed\",\"anonymous\":false,\"inputs\":[{\"name\":\"coins\",\"type\":\"address[]\",\"indexed\":false},{\"name\":\"A\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"fee\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"deployer\",\"type\":\"address\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"MetaPoolDeployed\",\"anonymous\":false,\"inputs\":[{\"name\":\"coin\",\"type\":\"address\",\"indexed\":false},{\"name\":\"base_pool\",\"type\":\"address\",\"indexed\":false},{\"name\":\"A\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"fee\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"deployer\",\"type\":\"address\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"LiquidityGaugeDeployed\",\"anonymous\":false,\"inputs\":[{\"name\":\"pool\",\"type\":\"address\",\"indexed\":false},{\"name\":\"gauge\",\"type\":\"address\",\"indexed\":false}]}]"
+      },
+      {
         "contractName": "ClearOracle",
         "content": "[{\"type\":\"event\",\"name\":\"ClearOracleRateChanged\",\"anonymous\":false,\"inputs\":[{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"price\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"ClearOracleRedemptionPriceChanged\",\"anonymous\":false,\"inputs\":[{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"redemptionPrice\",\"type\":\"uint256\",\"indexed\":false}]},{\"type\":\"event\",\"name\":\"OracleConfigured\",\"anonymous\":false,\"inputs\":[{\"name\":\"enabled\",\"type\":\"bool\",\"indexed\":true},{\"name\":\"asset\",\"type\":\"address\",\"indexed\":true},{\"name\":\"assetDecimals\",\"type\":\"uint8\",\"indexed\":false},{\"name\":\"oracleDecimals\",\"type\":\"uint8\",\"indexed\":false},{\"name\":\"priceTTL\",\"type\":\"uint256\",\"indexed\":false},{\"name\":\"redemptionPrice\",\"type\":\"uint256\",\"indexed\":false}]}]"
       },
@@ -135,6 +140,16 @@
         "factoryCreationAddressLogArg": "pool"
       },
       {
+        "_comment": "CurveStableSwapFactoryNG as a plain CONTRACT source: it CANNOT be a FACTORY source, because PlainPoolDeployed/MetaPoolDeployed carry no address for a creation rule to read. The exporter resolves each pool from the deployment transaction over RPC and creates the child source itself, so every pool deployed through this factory gets indexed without being listed below.",
+        "pipeline": "clear",
+        "abi": "CurveStableSwapFactoryNG",
+        "type": "CONTRACT",
+        "enabled": true,
+        "startBlock": 0,
+        "address": "0x0000000000000000000000000000000000000008"
+      },
+      {
+        "_comment": "A pool declared by hand. Pools deployed through the Curve factory above are discovered and sourced automatically, so this entry is only needed for a pool that predates indexing.",
         "pipeline": "clear",
         "abi": "CurveStableSwapNG",
         "type": "CONTRACT",
@@ -169,7 +184,7 @@
         "pluginConfig": {
           "dsn": "postgres://evmi:secret@postgres:5432/clear?sslmode=disable",
           "autoMigrate": true,
-          "_comment_contracts": "Address->kind registry seeded on Init. kind: base_reserve|meta_reserve|iou|curve|oracle|factory|curve_deployer. IOUs are discovered at AssetAdded, reserves at NewClearReserve and deployer-built pools at PoolDeployed, so those need not be listed. Match these to the source addresses above.",
+          "_comment_contracts": "Address->kind registry seeded on Init. kind: base_reserve|meta_reserve|iou|curve|oracle|factory|curve_deployer|curve_factory. IOUs are discovered at AssetAdded, reserves at NewClearReserve, deployer-built pools at PoolDeployed and every Curve pool at PlainPoolDeployed/MetaPoolDeployed, so those need not be listed. Match these to the source addresses above.",
           "contracts": [
             { "address": "0x0000000000000000000000000000000000000001", "kind": "base_reserve" },
             { "address": "0x0000000000000000000000000000000000000002", "kind": "meta_reserve" },
@@ -177,7 +192,8 @@
             { "address": "0x0000000000000000000000000000000000000004", "kind": "oracle" },
             { "address": "0x0000000000000000000000000000000000000005", "kind": "oracle" },
             { "address": "0x0000000000000000000000000000000000000006", "kind": "factory" },
-            { "address": "0x0000000000000000000000000000000000000007", "kind": "curve_deployer" }
+            { "address": "0x0000000000000000000000000000000000000007", "kind": "curve_deployer" },
+            { "address": "0x0000000000000000000000000000000000000008", "kind": "curve_factory" }
           ]
         }
       }

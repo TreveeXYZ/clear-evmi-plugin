@@ -4,10 +4,18 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core/types"
 	exporter "github.com/evmi-cloud/go-evm-indexer/pkg/exporter"
+	"github.com/lmittmann/w3"
 )
 
 // Integration test against a real PostgreSQL (the plugin uses NUMERIC / JSONB /
@@ -43,6 +51,15 @@ const (
 	iouPool      = "0x00000000000000000000000000000000ioupoo10"
 	treasuryAddr = "0x0000000000000000000000000000000007rea5u0"
 	implAddr     = "0x0000000000000000000000000000000000imp100"
+
+	// The Curve factory path goes through ABI-encoded RPC replies, so these have
+	// to be real hex (the placeholders above only ever travel as text).
+	curveFactoryAddr = "0x00000000000000000000000000000000000fac00"
+	plainPool        = "0x0000000000000000000000000000000000000aa1"
+	metaPool         = "0x0000000000000000000000000000000000000bb2"
+	poolCoinA        = "0x0000000000000000000000000000000000000cc3"
+	poolCoinB        = "0x0000000000000000000000000000000000000dd4"
+	poolImplAddr     = "0x0000000000000000000000000000000000000ee5"
 )
 
 var allTables = []string{
@@ -51,25 +68,149 @@ var allTables = []string{
 	"clear_reserve_activity", "clear_reserve_value_history", "clear_reserve_settings",
 	"clear_protocol_config", "clear_iou_tokens",
 	"clear_iou_balances", "clear_oracle_prices", "clear_oracle_price_history",
-	"clear_curve_pools", "clear_curve_lp_balances", "clear_curve_swaps",
-	"clear_curve_liquidity",
+	"clear_curve_pools", "clear_curve_pool_coins", "clear_curve_lp_balances",
+	"clear_curve_swaps", "clear_curve_liquidity",
+}
+
+// stubCurveNode stands in for the chain's RPC endpoint on the Curve factory path:
+// PlainPoolDeployed/MetaPoolDeployed name no pool, so the exporter reads the
+// deployment receipt to recover the address and then batches a handful of
+// getters. Receipts are keyed by transaction hash; eth_call is answered per
+// (to, function). It speaks the batch protocol, since that is what w3 sends for
+// more than one call, and answers an unknown function with a revert — the
+// best-effort case that must leave one column NULL without costing the others.
+func stubCurveNode(t *testing.T, receipts map[string][]*types.Log) *httptest.Server {
+	t.Helper()
+
+	ethCall := func(to, data string) (any, bool) {
+		input := common.FromHex(data)
+		if len(input) < 4 {
+			return nil, false
+		}
+		// On the factory the pool is the call's only argument; on the pool itself
+		// it is the callee.
+		pool := common.HexToAddress(to)
+		if normAddr(to) == curveFactoryAddr && len(input) >= 36 {
+			pool = common.BytesToAddress(input[len(input)-20:])
+		}
+		meta := pool == common.HexToAddress(metaPool)
+
+		encode := func(f *w3.Func, values ...any) (any, bool) {
+			out, err := f.Returns.Pack(values...)
+			if err != nil {
+				t.Errorf("stub node: pack %s returns: %v", f.Signature, err)
+				return nil, false
+			}
+			return hexutil.Encode(out), true
+		}
+		switch selector := [4]byte(input[:4]); selector {
+		case funcName.Selector:
+			if meta {
+				return encode(funcName, "Clear IOU meta")
+			}
+			return encode(funcName, "Clear base pool")
+		case funcSymbol.Selector:
+			if meta {
+				return encode(funcSymbol, "clrIOU")
+			}
+			return encode(funcSymbol, "clrBASE")
+		case funcDecimals.Selector:
+			if meta {
+				// One getter reverting must cost only its own column: the rest of
+				// the batch still answers, so everything else on this pool lands.
+				return nil, false
+			}
+			return encode(funcDecimals, uint8(18))
+		case funcGetCoins.Selector:
+			if meta {
+				return encode(funcGetCoins, []common.Address{common.HexToAddress(poolCoinA), common.HexToAddress(plainPool)})
+			}
+			return encode(funcGetCoins, []common.Address{common.HexToAddress(poolCoinA), common.HexToAddress(poolCoinB)})
+		case funcGetDecimals.Selector:
+			return encode(funcGetDecimals, []*big.Int{big.NewInt(6), big.NewInt(18)})
+		case funcGetImplementation.Selector:
+			return encode(funcGetImplementation, common.HexToAddress(poolImplAddr))
+		case funcIsMeta.Selector:
+			return encode(funcIsMeta, meta)
+		}
+		return nil, false
+	}
+
+	// One request may hold a single call object or a batch array; reply in kind.
+	type rpcReq struct {
+		ID     json.RawMessage   `json:"id"`
+		Method string            `json:"method"`
+		Params []json.RawMessage `json:"params"`
+	}
+	answer := func(req rpcReq) map[string]any {
+		resp := map[string]any{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_getTransactionReceipt":
+			var hash string
+			json.Unmarshal(req.Params[0], &hash)
+			resp["result"] = &types.Receipt{
+				Status: types.ReceiptStatusSuccessful,
+				TxHash: common.HexToHash(hash),
+				Logs:   receipts[hash],
+			}
+		case "eth_call":
+			var call struct{ To, Data string }
+			json.Unmarshal(req.Params[0], &call)
+			if result, ok := ethCall(call.To, call.Data); ok {
+				resp["result"] = result
+			} else {
+				resp["error"] = map[string]any{"code": 3, "message": "execution reverted"}
+			}
+		default:
+			resp["error"] = map[string]any{"code": -32601, "message": "unexpected method " + req.Method}
+		}
+		return resp
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+
+		var batch []rpcReq
+		if json.Unmarshal(body, &batch) == nil {
+			out := make([]map[string]any, len(batch))
+			for i, req := range batch {
+				out[i] = answer(req)
+			}
+			json.NewEncoder(w).Encode(out)
+			return
+		}
+		var single rpcReq
+		if err := json.Unmarshal(body, &single); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		json.NewEncoder(w).Encode(answer(single))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 // blockTs is the synthetic block-header timestamp for a block (unix seconds).
 func blockTs(block uint64) uint64 { return 1_700_000_000 + block }
 
+// txHashOf is the synthetic transaction hash for a log, unique per (block, index).
+func txHashOf(block, idx uint64) string { return fmt.Sprintf("0x%064x", block*1_000+idx) }
+
 func mkLog(block, idx uint64, contract, addr, event string, args map[string]string) exporter.LogEvent {
 	return exporter.LogEvent{
-		Id:              fmt.Sprintf("1:%d:%d", block, idx),
-		ChainId:         1,
-		ContractName:    contract,
-		EventName:       event,
-		Address:         addr,
-		Args:            args,
-		BlockNumber:     block,
-		BlockTimestamp:  blockTs(block),
-		LogIndex:        idx,
-		TransactionHash: fmt.Sprintf("0xtx%d%d", block, idx),
+		Id:             fmt.Sprintf("1:%d:%d", block, idx),
+		ChainId:        1,
+		ContractName:   contract,
+		EventName:      event,
+		Address:        addr,
+		Args:           args,
+		BlockNumber:    block,
+		BlockTimestamp: blockTs(block),
+		LogIndex:       idx,
+		// Real 32-byte hex: the Curve factory path parses it into a common.Hash to
+		// fetch the deployment receipt, and anything else resolves to the zero hash.
+		TransactionHash: txHashOf(block, idx),
 	}
 }
 
@@ -120,13 +261,25 @@ func TestReplayProtocol(t *testing.T) {
 	const oracleAddr = "0x0000000000000000000000000000000000rac1e"
 	const adapterAddr = "0x00000000000000000000000000000000adap7e0"
 
+	const CURVEFACTORY = "CurveStableSwapFactoryNG"
+
+	// The two Curve factory deployments below, as their transactions look on chain:
+	// the pool's constructor Transfer(0x0, factory, 0) precedes the deploy event, and
+	// that is the only place the new address appears.
+	node := stubCurveNode(t, map[string][]*types.Log{
+		txHashOf(111, 1): {constructorTransferLog(plainPool, curveFactoryAddr, 0)},
+		txHashOf(112, 1): {constructorTransferLog(metaPool, curveFactoryAddr, 0)},
+	})
+
 	e := &clearExporter{}
 	// Seed the address->kind registry from config (the base reserve, pool, both
-	// oracle contracts, the reserve factory and the curve pool deployer). IOUs are
-	// discovered at AssetAdded, reserves at NewClearReserve, deployer-built pools at
-	// PoolDeployed — none of those need to be listed here.
+	// oracle contracts, the reserve factory, the curve pool deployer and the Curve
+	// factory). IOUs are discovered at AssetAdded, reserves at NewClearReserve,
+	// deployer-built pools at PoolDeployed and factory-built pools at
+	// PlainPoolDeployed/MetaPoolDeployed — none of those need to be listed here.
 	cfg, _ := json.Marshal(pluginConfig{
-		Dsn: dsn,
+		Dsn:    dsn,
+		RpcUrl: node.URL,
 		Contracts: []contractConfig{
 			{Address: reserve, Kind: "base_reserve"},
 			{Address: pool, Kind: "curve"},
@@ -134,6 +287,7 @@ func TestReplayProtocol(t *testing.T) {
 			{Address: adapterAddr, Kind: "oracle"},
 			{Address: factory, Kind: "factory"},
 			{Address: deployer, Kind: "curve_deployer"},
+			{Address: curveFactoryAddr, Kind: "curve_factory"},
 		},
 	})
 	if err := e.Init(exporter.Context{ExporterName: "clear-defi-test", PipelineId: 1, ChainId: 1, Config: cfg}); err != nil {
@@ -231,6 +385,16 @@ func TestReplayProtocol(t *testing.T) {
 			"reserve": reserve, "basePool": pool, "coin": zeroAddr, "pool": pool}),
 		mkLog(110, 1, DEPLOYER, deployer, "PoolDeployed", map[string]string{
 			"reserve": reserve, "basePool": pool, "coin": iou1, "pool": iouPool}),
+
+		// Curve's own factory: a plain pool then a metapool against it. Neither event
+		// names the pool it created — the exporter resolves it from the transaction
+		// receipt (log index 1, so the constructor Transfer at index 0 precedes it)
+		// and reads the rest back with getters. `coins` arrives in Go's fmt.Sprint
+		// rendering, the shape a server with no slice case emits.
+		mkLog(111, 1, CURVEFACTORY, curveFactoryAddr, "PlainPoolDeployed", map[string]string{
+			"coins": "[" + poolCoinA + " " + poolCoinB + "]", "A": "200", "fee": "1000000", "deployer": deployer}),
+		mkLog(112, 1, CURVEFACTORY, curveFactoryAddr, "MetaPoolDeployed", map[string]string{
+			"coin": poolCoinA, "base_pool": plainPool, "A": "500", "fee": "4000000", "deployer": deployer}),
 	}
 
 	for _, l := range logs {
@@ -380,6 +544,33 @@ func TestReplayProtocol(t *testing.T) {
 	// The base pool was seeded from config; PoolDeployed must not downgrade its row.
 	eq(t, db, "base pool still config-sourced", `SELECT count(*) FROM clear_contracts
 		 WHERE chain_id=1 AND address=$1 AND kind='curve' AND source='config'`, pool)
+
+	// --- curve factory: pools resolved off an event that does not name them ---
+	eq(t, db, "plain pool resolved from receipt", `SELECT count(*) FROM clear_curve_pools
+		 WHERE address=$1 AND curve_factory=$2 AND is_meta = FALSE AND amplification=200 AND fee=1000000
+		   AND name='Clear base pool' AND symbol='clrBASE' AND decimals=18 AND implementation=$3
+		   AND n_coins=2 AND deployer=$4 AND first_block=111`,
+		plainPool, curveFactoryAddr, poolImplAddr, deployer)
+	// The stub node reverts decimals() on the metapool: that column stays NULL
+	// while every other call in the same batch still lands.
+	eq(t, db, "metapool resolved from receipt", `SELECT count(*) FROM clear_curve_pools
+		 WHERE address=$1 AND curve_factory=$2 AND is_meta AND amplification=500 AND fee=4000000
+		   AND name='Clear IOU meta' AND symbol='clrIOU' AND decimals IS NULL
+		   AND implementation=$3 AND base_pool=$4 AND coin=$5 AND n_coins=2`,
+		metaPool, curveFactoryAddr, poolImplAddr, plainPool, poolCoinA)
+	// The coin list comes from the factory getter, in the pool's own slot order —
+	// the order TokenExchange's sold_id/bought_id index into.
+	eq(t, db, "plain pool coin 0", `SELECT count(*) FROM clear_curve_pool_coins
+		 WHERE pool=$1 AND position=0 AND coin=$2 AND decimals=6`, plainPool, poolCoinA)
+	eq(t, db, "plain pool coin 1", `SELECT count(*) FROM clear_curve_pool_coins
+		 WHERE pool=$1 AND position=1 AND coin=$2 AND decimals=18`, plainPool, poolCoinB)
+	eq(t, db, "metapool pairs against the plain pool", `SELECT count(*) FROM clear_curve_pool_coins
+		 WHERE pool=$1 AND position=1 AND coin=$2`, metaPool, plainPool)
+	// Both pools now route to dispatchCurve without ever being configured.
+	if n := count(t, db, `SELECT count(*) FROM clear_contracts
+		 WHERE chain_id=1 AND address IN ($1,$2) AND kind='curve' AND source='dynamic'`, plainPool, metaPool); n != 2 {
+		t.Errorf("curve factory pools tracked = %d, want 2", n)
+	}
 
 	// --- idempotency: redelivering logs must not double-apply ---
 	redeliver := []exporter.LogEvent{

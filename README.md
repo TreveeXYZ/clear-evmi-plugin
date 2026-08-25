@@ -4,17 +4,22 @@ Materializes the [Clear](https://github.com/…/clear-smart-contracts) protocol 
 PostgreSQL from the pipeline's decoded logs: reserves, IOU tokens, Curve StableSwap-NG pools,
 all user balances, and the full swap/liquidity history.
 
-Everything is derived **purely from events** (an exporter plugin gets no RPC access), so:
+Every figure is derived **purely from events**, so:
 
 - balances are exact only when indexing starts **at or before** each contract's first event;
 - delivery is at-least-once, but a processed-event ledger makes writes **exactly-once**, so
   balance arithmetic never double-counts on a restart.
 
+The one exception is contract *discovery*: the Curve factory announces a pool deployment without
+naming the pool, so that address is resolved over the chain's RPC endpoint and the pool is
+registered for indexing through the host API — see
+[Curve pools discover themselves](#curve-pools-discover-themselves).
+
 ## What it computes
 
 | Table | Content |
 |-------|---------|
-| `clear_contracts` | address → kind routing registry (`base_reserve`, `meta_reserve`, `iou`, `curve`, `oracle`, `factory`, `curve_deployer`) |
+| `clear_contracts` | address → kind routing registry (`base_reserve`, `meta_reserve`, `iou`, `curve`, `oracle`, `factory`, `curve_deployer`, `curve_factory`) |
 | `clear_reserves` | per reserve: `kind` (base/meta), `lp_supply`, cumulative `total_deposits`/`total_withdrawals`, `iou_minted`/`iou_redeemed`, `swap_count`, plus `name`/`symbol`/`implementation`/`tokens` from the factory's `NewClearReserve` |
 | `clear_reserve_settings` | per reserve: every governance parameter, folded from the `set*` events (fees, distributions, swap-spread window, rebalance trigger, deposit-weight tolerance) |
 | `clear_reserve_lp_balances` | `(reserve, holder) → balance` — every LP holder |
@@ -27,7 +32,8 @@ Everything is derived **purely from events** (an exporter plugin gets no RPC acc
 | `clear_oracle_prices` | per asset: price, redemption price, TTL, decimals, enabled, last refresh — folded from `ClearOracle` + `PythOracleAdapter` |
 | `clear_oracle_price_history` | every `ClearOracleRateChanged` as a price point (for charts) |
 | `clear_protocol_config` | the factory's protocol-wide config: `treasury` and each clone implementation + version |
-| `clear_curve_pools` | per pool: `lp_supply`, `swap_count`, and the reserve / base pool / paired coin it was deployed for |
+| `clear_curve_pools` | per pool: `lp_supply`, `swap_count`, the reserve / base pool / paired coin it was deployed for, plus `name`/`symbol`/`decimals`/`amplification`/`fee`/`implementation`/`is_meta` read back when the Curve factory announced it |
+| `clear_curve_pool_coins` | `(pool, position) → coin, decimals` — a pool's coins in slot order (the order `TokenExchange`'s `sold_id`/`bought_id` index into) |
 | `clear_curve_lp_balances` | `(pool, holder) → balance` |
 | `clear_curve_swaps` | `TokenExchange` / `TokenExchangeUnderlying` history |
 | `clear_curve_liquidity` | add/remove liquidity history (token amounts as JSON, `token_supply`) |
@@ -76,8 +82,9 @@ that happens, `go get -u github.com/evmi-cloud/go-evm-indexer` and reinstall.
    - `IOU` → e.g. `ClearIOU`
    - `Curve` / `StableSwap` / `Pool` → e.g. `CurveStableSwapNG` (include `Transfer`, `TokenExchange`, and the liquidity events)
    - `Oracle` → e.g. `ClearOracle`, `PythOracleAdapter`
-   - `Reserve` + `Factory` → `ClearReserveFactory`; `Deployer` → `ClearCurvePoolDeployer`
-     (both matched *before* the generic reserve/curve cases)
+   - `Reserve` + `Factory` → `ClearReserveFactory`; `Deployer` → `ClearCurvePoolDeployer`;
+     `Curve`/`StableSwap` + `Factory` → `CurveStableSwapFactoryNG` (all matched *before* the
+     generic reserve/curve cases)
 2. **Blockchain**, **log store**, **pipeline** — as usual.
 3. **Sources** — add a source per contract (CONTRACT), plus FACTORY sources for the contracts that
    spawn others: each reserve spawns its `ClearIOU`s via `AssetAdded`, and the
@@ -103,6 +110,42 @@ that happens, `go get -u github.com/evmi-cloud/go-evm-indexer` and reinstall.
 
    Start it; it processes the pipeline's logs in block order and fills the tables.
 
+### Curve pools discover themselves
+
+Add the **`CurveStableSwapFactoryNG` as a plain `CONTRACT` source** and every pool deployed
+through it is picked up on its own — no source entry, no `contracts` entry per pool.
+
+It cannot be a `FACTORY` source: `PlainPoolDeployed` and `MetaPoolDeployed` carry the coins, `A`,
+the fee and the deployer, but **not the address of the pool they just created**, so there is
+nothing for a creation rule to read. Instead the exporter resolves it itself, using the host API
+(EVMI ≥ 0.3.0):
+
+1. `Host.Blockchain()` gives the JSON-RPC endpoint the indexer already polls, which the exporter
+   dials with [`lmittmann/w3`](https://github.com/lmittmann/w3);
+2. the pool address is recovered from the deployment **transaction receipt** — every
+   StableSwap-NG pool fires `Transfer(0x0, factory, 0)` from its constructor, so the pool is the
+   emitter of the last such log before the deploy event. This needs no archive node, and stays
+   exact when one transaction deploys several pools (the `ClearCurvePoolDeployer` does);
+3. `name`/`symbol`/`decimals` come from the pool, and the coins, their decimals, the blueprint
+   implementation and `is_meta` from the factory's registry view — all seven getters in a single
+   batched request. Each is best-effort: one that reverts leaves its own column NULL without
+   costing the others;
+4. `Host.CreateLogSource` registers the pool as a child source of the factory, from the
+   deployment block, decoding with the `CurvePoolAbi` ABI — which is what makes its swaps,
+   liquidity events and LP transfers start arriving. The call is idempotent per
+   (parent, address), so a redelivered deployment log never creates a duplicate.
+
+Optional `pluginConfig` keys for this path:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `rpcUrl` | the endpoint EVMI polls | override, for a plugin that should not share that node |
+| `curvePoolAbi` | `CurveStableSwapNG` | ABI the created pool sources decode with; registered from the copy embedded in this plugin if the server does not have it |
+| `indexCurvePools` | `true` | set `false` to record the pool in `clear_curve_pools` but leave indexing it to a hand-declared source |
+
+On an EVMI older than the host API (or with no reachable RPC endpoint) this degrades to a warning
+on stderr: everything else still works, pools just have to be declared by hand as before.
+
 > Array ABI args (`amounts[]`, `token_amounts`/`fees`, `tokens[]`) arrive in one of two
 > renderings depending on the server version — a JSON array, or Go's `fmt.Sprint` form
 > (`[1 2]`, which is *not* JSON). Both are accepted; see `splitArrayArg` in `db.go`.
@@ -112,9 +155,10 @@ that happens, `go get -u github.com/evmi-cloud/go-evm-indexer` and reinstall.
 `autoload.config.json` in this folder wires the whole thing declaratively — pass it as the EVMI
 server config and every resource below is created on startup if absent (idempotent):
 
-- the eight **ABIs** (`ClearBaseReserve`, `ClearMetaReserve`, `ClearIOU`, `ClearReserveFactory`,
-  `ClearCurvePoolDeployer`, `CurveStableSwapNG`, `ClearOracle`, `PythOracleAdapter` — generated
-  from the deployed artifacts), a **blockchain** (sepolia), a **log store** (clickhouse), a
+- the nine **ABIs** (`ClearBaseReserve`, `ClearMetaReserve`, `ClearIOU`, `ClearReserveFactory`,
+  `ClearCurvePoolDeployer`, `CurveStableSwapNG`, `CurveStableSwapFactoryNG`, `ClearOracle`,
+  `PythOracleAdapter` — generated from the deployed artifacts), a **blockchain** (sepolia), a
+  **log store** (clickhouse), a
   **pipeline** (`clear`), and the **exporter** (with its Postgres `dsn` and the address→kind
   `contracts` registry);
 - the **base and meta reserves as `FACTORY` sources** — each indexes the reserve's own events *and*
@@ -122,6 +166,8 @@ server config and every resource below is created on startup if absent (idempote
   (`factoryCreationAddressLogArg: "iou"`);
 - the **`ClearCurvePoolDeployer` as a `FACTORY` source** — every pool it deploys becomes a
   `CurveStableSwapNG` child source (`PoolDeployed` / `pool`);
+- the **`CurveStableSwapFactoryNG` as a `CONTRACT` source** — the exporter resolves each pool it
+  announces over RPC and creates the child source itself (see above);
 - the **`ClearReserveFactory`**, both oracle contracts and any externally-deployed Curve pool as
   plain `CONTRACT` sources;
 - the plugin itself (via `plugins`: `gitUrl` + optional `gitRef`) — the server clones and
@@ -184,5 +230,11 @@ GROUP BY p.address, p.lp_supply;
   NULL until then (see `RESERVE-SETTINGS.md` in the contracts repo for the defaults).
 - Curve LP `lp_supply` is tracked from the pool's ERC20 `Transfer`s (mint/burn); the `token_supply`
   reported by each liquidity event is also stored per-row in `clear_curve_liquidity`.
+- **Curve pool discovery is the only path that touches RPC**, and only on a deployment — never
+  per event. It needs a full node (receipts + current-state `eth_call`, no archive state), and it
+  shares the endpoint the indexer polls, so it is deliberately two round trips per pool: the
+  receipt, then every getter in one batch. A pool metadata getter that reverts leaves its own
+  column NULL and costs the rest of the batch nothing; an unresolvable address is a warning, while
+  a transport failure fails the event so EVMI redelivers it.
 - If indexing starts mid-history, holders who received tokens before the start block can show
   negative balances — start at the deployment block for exact figures.

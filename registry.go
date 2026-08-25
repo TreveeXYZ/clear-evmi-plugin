@@ -31,6 +31,8 @@ func (k contractKind) String() string {
 		return "factory"
 	case curveDeployerKind:
 		return "curve_deployer"
+	case curveFactoryKind:
+		return "curve_factory"
 	default:
 		return "unknown"
 	}
@@ -54,6 +56,8 @@ func kindFromString(s string) contractKind {
 		return factoryKind
 	case "curve_deployer", "curvedeployer", "pool_deployer", "pooldeployer", "deployer":
 		return curveDeployerKind
+	case "curve_factory", "curvefactory", "stableswap_factory", "stableswapfactory", "pool_factory", "poolfactory":
+		return curveFactoryKind
 	default:
 		return unknownKind
 	}

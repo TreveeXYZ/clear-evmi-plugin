@@ -20,6 +20,7 @@ registered for indexing through the host API — see
 | Table | Content |
 |-------|---------|
 | `clear_contracts` | address → kind routing registry (`base_reserve`, `meta_reserve`, `iou`, `curve`, `oracle`, `factory`, `curve_deployer`, `curve_factory`) |
+| `clear_tokens` | ERC20 directory: every token address the protocol touches — reserve assets, IOUs, reserve LP tokens, Curve pool LP tokens and their coins — with `name`/`symbol`/`decimals` read off the chain on first sight |
 | `clear_reserves` | per reserve: `kind` (base/meta), `lp_supply`, cumulative `total_deposits`/`total_withdrawals`, `iou_minted`/`iou_redeemed`, `swap_count`, plus `name`/`symbol`/`implementation`/`tokens` from the factory's `NewClearReserve` |
 | `clear_reserve_settings` | per reserve: every governance parameter, folded from the `set*` events (fees, distributions, swap-spread window, rebalance trigger, deposit-weight tolerance) |
 | `clear_reserve_lp_balances` | `(reserve, holder) → balance` — every LP holder |

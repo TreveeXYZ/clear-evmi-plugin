@@ -47,6 +47,25 @@ CREATE TABLE IF NOT EXISTS clear_contracts (
 );
 CREATE INDEX IF NOT EXISTS clear_contracts_kind ON clear_contracts (chain_id, kind);
 
+-- ERC20 directory: one row per token address the protocol has been seen to touch
+-- — a reserve's underlying assets, the IOUs minted against them, reserve LP
+-- tokens, Curve pool LP tokens and the coins those pools pair. It is filled on
+-- FIRST SIGHT only (see ensureToken): the row is claimed, then name/symbol/
+-- decimals are read off the token over RPC, so a token already listed costs
+-- nothing. A column stays NULL when the getter reverts (a token that returns
+-- bytes32 for name/symbol, say) and no RPC endpoint is configured at all leaves
+-- everything but what the discovery event carried NULL.
+CREATE TABLE IF NOT EXISTS clear_tokens (
+    chain_id    BIGINT NOT NULL,
+    address     TEXT NOT NULL,
+    name        TEXT,
+    symbol      TEXT,
+    decimals    SMALLINT,
+    first_block BIGINT,
+    PRIMARY KEY (chain_id, address)
+);
+CREATE INDEX IF NOT EXISTS clear_tokens_symbol ON clear_tokens (chain_id, symbol);
+
 -- Reserves (Clear base/meta reserves; the LP token IS the reserve contract).
 -- name/symbol/implementation/reserve_index/tokens/factory come from the factory's
 -- NewClearReserve event and are NULL for a reserve indexed from its own logs only

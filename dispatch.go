@@ -57,7 +57,7 @@ func (e *clearExporter) dispatchReserve(tx *sql.Tx, log exporter.LogEvent, k con
 	case "IOURedeemed":
 		return handleIOURedeemed(tx, log, k)
 	case "AssetAdded":
-		if err := handleAssetAdded(tx, log, k); err != nil {
+		if err := e.handleAssetAdded(tx, log, k); err != nil {
 			return err
 		}
 		// Track the spawned IOU so its Transfers route to the IOU dispatcher.

@@ -104,6 +104,18 @@ The parameter reference is `RESERVE-SETTINGS.md` in the contracts repo. Two thin
 - **`clear_reserves`** gains `name`/`symbol`/`implementation`/`reserve_index`/`tokens`/`factory` from `NewClearReserve`. They stay NULL for a reserve seen only through its own logs (indexing started after deployment, or the factory isn't a source).
 - **`clear_curve_pools`** gains `reserve`/`base_pool`/`coin`/`is_base_pool`/`deployer` from `PoolDeployed`, which links every deployer-built pool back to the reserve it serves. `coin == 0` marks the reserve's plain base pool (there `pool == basePool`); it is stored as `is_base_pool = true` with `coin` NULL. Otherwise the pool is a metapool pairing `coin` — an asset's IOU, or a meta reserve's native token / native IOU — against `base_pool`.
 
+## Token directory (`clear_tokens`)
+
+One row per ERC20 the protocol touches, keyed `(chain_id, address)`, with `name`/`symbol`/`decimals`. `ensureToken` (`handlers.go`) is called wherever a token address **enters** the schema — `handleAssetAdded` (a reserve's asset, the IOU minted against it, and the reserve's own LP token), `handleNewClearReserve` (the reserve LP + its `tokens[]`), `handlePoolDeployed` and `handleCurvePoolDeployed` (the pool's LP token + the coins it pairs).
+
+Three things make it cheap and safe to call from those paths:
+
+- **Claim first, fetch second.** It does `INSERT … ON CONFLICT DO NOTHING` and only the writer that actually inserted the row spends an RPC round trip (`fetchTokenMeta`, one batch of `name()`/`symbol()`/`decimals()`), so a token already listed costs one indexed no-op INSERT. The claim lives in the caller's transaction, so a later failure rolls it back and the token is fetched again on redelivery — no half-written row survives.
+- **Hints from the event.** `AssetAdded` states the asset's `decimals` and `NewClearReserve` the reserve's `name`/`symbol`; those are passed as `tokenMeta` hints. A **complete** set of hints skips the fetch entirely (that is how a Curve pool's LP token costs nothing — its metadata was just read back by `fetchCurvePool`).
+- **Patch, never overwrite.** The update is `COALESCE(existing, new)` on every column, and a call with hints runs it even when the row already exists. So whichever site sees the token first keeps its answer, and a later event can fill a gap the getters left — a token whose `name()`/`symbol()` revert (bytes32-era ERC20s) still gets its `decimals` from the `AssetAdded` that names it, in either order.
+
+Same best-effort rule as the pool metadata: a getter that reverts leaves its column NULL, only a request-level failure fails the event. With no RPC endpoint configured, rows still appear with whatever the discovery events carried. A token only reachable through flow events (a swap's `tokenIn` on a reserve whose `AssetAdded` predates the start block) is **not** registered — the same start-at-deployment caveat as the balances.
+
 ## Curve pool discovery (`curve.go`, `host.go`) — the one path that leaves the process
 
 `CurveStableSwapFactoryNG` catches every pool deployed through Curve's own factory, not just the ones `ClearCurvePoolDeployer` built. Its two deployment events — `PlainPoolDeployed(coins[], A, fee, deployer)` and `MetaPoolDeployed(coin, base_pool, A, fee, deployer)` — **do not carry the address of the pool they created** (`deploy_plain_pool`/`deploy_metapool` return it, they never log it). So no EVMI `FACTORY` source can spawn the child; the factory is a plain `CONTRACT` source and `handleCurvePoolDeployed` does the work:

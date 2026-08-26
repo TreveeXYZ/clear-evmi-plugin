@@ -63,7 +63,7 @@ const (
 )
 
 var allTables = []string{
-	"clear_processed_events", "clear_contracts", "clear_reserves", "clear_reserve_lp_balances",
+	"clear_processed_events", "clear_contracts", "clear_tokens", "clear_reserves", "clear_reserve_lp_balances",
 	"clear_reserve_assets", "clear_reserve_token_balances", "clear_reserve_swaps",
 	"clear_reserve_activity", "clear_reserve_value_history", "clear_reserve_settings",
 	"clear_protocol_config", "clear_iou_tokens",
@@ -82,19 +82,27 @@ var allTables = []string{
 func stubCurveNode(t *testing.T, receipts map[string][]*types.Log) *httptest.Server {
 	t.Helper()
 
+	// The ERC20s this node knows about. Everything else — including every
+	// placeholder address above, which is not valid hex and therefore reaches the
+	// node as the zero address — reverts, which is the case a token has to survive
+	// with only what its discovery event carried.
+	type erc20 struct {
+		name     string
+		symbol   string
+		decimals uint8
+	}
+	tokens := map[common.Address]erc20{
+		common.HexToAddress(plainPool): {"Clear base pool", "clrBASE", 18},
+		common.HexToAddress(metaPool):  {"Clear IOU meta", "clrIOU", 18},
+		common.HexToAddress(poolCoinA): {"Coin A", "CA", 6},
+		common.HexToAddress(poolCoinB): {"Coin B", "CB", 18},
+	}
+
 	ethCall := func(to, data string) (any, bool) {
 		input := common.FromHex(data)
 		if len(input) < 4 {
 			return nil, false
 		}
-		// On the factory the pool is the call's only argument; on the pool itself
-		// it is the callee.
-		pool := common.HexToAddress(to)
-		if normAddr(to) == curveFactoryAddr && len(input) >= 36 {
-			pool = common.BytesToAddress(input[len(input)-20:])
-		}
-		meta := pool == common.HexToAddress(metaPool)
-
 		encode := func(f *w3.Func, values ...any) (any, bool) {
 			out, err := f.Returns.Pack(values...)
 			if err != nil {
@@ -103,35 +111,49 @@ func stubCurveNode(t *testing.T, receipts map[string][]*types.Log) *httptest.Ser
 			}
 			return hexutil.Encode(out), true
 		}
-		switch selector := [4]byte(input[:4]); selector {
+		selector := [4]byte(input[:4])
+
+		// The factory's registry view: the pool is the call's single argument.
+		if normAddr(to) == curveFactoryAddr {
+			if len(input) < 36 {
+				return nil, false
+			}
+			pool := common.BytesToAddress(input[len(input)-20:])
+			meta := pool == common.HexToAddress(metaPool)
+			switch selector {
+			case funcGetCoins.Selector:
+				if meta {
+					return encode(funcGetCoins, []common.Address{common.HexToAddress(poolCoinA), common.HexToAddress(plainPool)})
+				}
+				return encode(funcGetCoins, []common.Address{common.HexToAddress(poolCoinA), common.HexToAddress(poolCoinB)})
+			case funcGetDecimals.Selector:
+				return encode(funcGetDecimals, []*big.Int{big.NewInt(6), big.NewInt(18)})
+			case funcGetImplementation.Selector:
+				return encode(funcGetImplementation, common.HexToAddress(poolImplAddr))
+			case funcIsMeta.Selector:
+				return encode(funcIsMeta, meta)
+			}
+			return nil, false
+		}
+
+		// ERC20 metadata, read off the token itself.
+		callee := common.HexToAddress(to)
+		token, known := tokens[callee]
+		if !known {
+			return nil, false
+		}
+		switch selector {
 		case funcName.Selector:
-			if meta {
-				return encode(funcName, "Clear IOU meta")
-			}
-			return encode(funcName, "Clear base pool")
+			return encode(funcName, token.name)
 		case funcSymbol.Selector:
-			if meta {
-				return encode(funcSymbol, "clrIOU")
-			}
-			return encode(funcSymbol, "clrBASE")
+			return encode(funcSymbol, token.symbol)
 		case funcDecimals.Selector:
-			if meta {
+			if callee == common.HexToAddress(metaPool) {
 				// One getter reverting must cost only its own column: the rest of
 				// the batch still answers, so everything else on this pool lands.
 				return nil, false
 			}
-			return encode(funcDecimals, uint8(18))
-		case funcGetCoins.Selector:
-			if meta {
-				return encode(funcGetCoins, []common.Address{common.HexToAddress(poolCoinA), common.HexToAddress(plainPool)})
-			}
-			return encode(funcGetCoins, []common.Address{common.HexToAddress(poolCoinA), common.HexToAddress(poolCoinB)})
-		case funcGetDecimals.Selector:
-			return encode(funcGetDecimals, []*big.Int{big.NewInt(6), big.NewInt(18)})
-		case funcGetImplementation.Selector:
-			return encode(funcGetImplementation, common.HexToAddress(poolImplAddr))
-		case funcIsMeta.Selector:
-			return encode(funcIsMeta, meta)
+			return encode(funcDecimals, token.decimals)
 		}
 		return nil, false
 	}
@@ -566,6 +588,34 @@ func TestReplayProtocol(t *testing.T) {
 		 WHERE pool=$1 AND position=1 AND coin=$2 AND decimals=18`, plainPool, poolCoinB)
 	eq(t, db, "metapool pairs against the plain pool", `SELECT count(*) FROM clear_curve_pool_coins
 		 WHERE pool=$1 AND position=1 AND coin=$2`, metaPool, plainPool)
+	// --- token directory ---
+	// Every address that entered the schema as an ERC20 is listed, on this chain.
+	for _, addr := range []string{usdc, usdt, iou1, iou2, reserve, metaReserve, nativeTok,
+		metaIou1, metaIou2, pool, iouPool, plainPool, metaPool, poolCoinA, poolCoinB} {
+		eq(t, db, "token "+addr, `SELECT count(*) FROM clear_tokens WHERE chain_id=1 AND address=$1`, addr)
+	}
+	if n := count(t, db, `SELECT count(*) FROM clear_tokens WHERE address = $1`, zeroAddr); n != 0 {
+		t.Error("the zero address must never be registered as a token")
+	}
+	// Fetched off the chain: the plain pool's metadata was already read back when
+	// the pool was resolved, so it lands without a second request; the coins are
+	// read fresh.
+	eq(t, db, "plain pool token", `SELECT count(*) FROM clear_tokens
+		 WHERE address=$1 AND name='Clear base pool' AND symbol='clrBASE' AND decimals=18 AND first_block=111`, plainPool)
+	eq(t, db, "coin A token", `SELECT count(*) FROM clear_tokens
+		 WHERE address=$1 AND name='Coin A' AND symbol='CA' AND decimals=6`, poolCoinA)
+	eq(t, db, "coin B token", `SELECT count(*) FROM clear_tokens
+		 WHERE address=$1 AND name='Coin B' AND symbol='CB' AND decimals=18`, poolCoinB)
+	// decimals() reverts on the metapool: name/symbol still land, that one is NULL.
+	eq(t, db, "metapool token", `SELECT count(*) FROM clear_tokens
+		 WHERE address=$1 AND name='Clear IOU meta' AND symbol='clrIOU' AND decimals IS NULL`, metaPool)
+	// A token whose getters all revert keeps what its discovery event carried:
+	// AssetAdded states the asset's decimals, so that survives with no name/symbol.
+	eq(t, db, "usdc token from the event alone", `SELECT count(*) FROM clear_tokens
+		 WHERE address=$1 AND decimals=6 AND name IS NULL AND symbol IS NULL AND first_block=100`, usdc)
+	eq(t, db, "meta leg token from the event alone", `SELECT count(*) FROM clear_tokens
+		 WHERE address=$1 AND decimals=6 AND first_block=109`, nativeTok)
+
 	// Both pools now route to dispatchCurve without ever being configured.
 	if n := count(t, db, `SELECT count(*) FROM clear_contracts
 		 WHERE chain_id=1 AND address IN ($1,$2) AND kind='curve' AND source='dynamic'`, plainPool, metaPool); n != 2 {

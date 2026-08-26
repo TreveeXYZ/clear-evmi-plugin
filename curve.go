@@ -39,7 +39,9 @@ import (
 //
 // This file is the only one that knows about go-ethereum / w3 types; everything
 // it hands back is the plain lowercase-hex-and-decimal-string world the rest of
-// the plugin (and the schema) works in.
+// the plugin (and the schema) works in. It also carries the one other chain read
+// the plugin makes — an ERC20's name/symbol/decimals on first sight of a token
+// (fetchTokenMeta), which reuses the same three bindings a pool is read with.
 
 // ABI bindings, from Solidity/Vyper signatures rather than a generated binding —
 // they are usable against any contract exposing that function.
@@ -207,6 +209,86 @@ func fetchCurvePool(client *w3.Client, factoryHex, poolHex string) curvePoolInfo
 		info.isMeta = sql.NullBool{Bool: isMeta, Valid: true}
 	}
 	return info
+}
+
+// --- ERC20 metadata (any token, not just Curve) ---
+
+// tokenMeta is what an ERC20 says about itself. It doubles as the hint type for
+// ensureToken: a discovery event that already carries one of these fields (a
+// reserve's `decimals` on AssetAdded, a reserve's name/symbol on NewClearReserve)
+// passes it in, and a complete set of hints skips the RPC round trip entirely.
+type tokenMeta struct {
+	name     string
+	symbol   string
+	decimals sql.NullInt64
+}
+
+// complete reports whether every field is known, i.e. nothing is left to fetch.
+func (m tokenMeta) complete() bool {
+	return m.name != "" && m.symbol != "" && m.decimals.Valid
+}
+
+// empty reports whether nothing at all is known, i.e. there is nothing to write.
+func (m tokenMeta) empty() bool { return m == tokenMeta{} }
+
+// withFallback fills in whatever the getters did not answer from the values the
+// discovery event carried.
+func (m tokenMeta) withFallback(hints tokenMeta) tokenMeta {
+	if m.name == "" {
+		m.name = hints.name
+	}
+	if m.symbol == "" {
+		m.symbol = hints.symbol
+	}
+	if !m.decimals.Valid {
+		m.decimals = hints.decimals
+	}
+	return m
+}
+
+// fetchTokenMeta reads an ERC20's name/symbol/decimals in one batched request.
+// Individual getters are best-effort — a token that does not implement one, or
+// that returns bytes32 for name/symbol the way some early ERC20s do, leaves that
+// field unset rather than failing the token. Only a failure of the request itself
+// is returned, because that one is worth retrying.
+func fetchTokenMeta(client *w3.Client, addrHex string) (tokenMeta, error) {
+	token := common.HexToAddress(addrHex)
+
+	var (
+		name     string
+		symbol   string
+		decimals uint8
+	)
+	labels := []string{"name()", "symbol()", "decimals()"}
+	calls := []w3types.RPCCaller{
+		eth.CallFunc(token, funcName).Returns(&name),
+		eth.CallFunc(token, funcSymbol).Returns(&symbol),
+		eth.CallFunc(token, funcDecimals).Returns(&decimals),
+	}
+
+	var callErrs w3.CallErrors
+	if err := client.Call(calls...); errors.As(err, &callErrs) {
+		for i, callErr := range callErrs {
+			if callErr != nil {
+				warnf("[clear-defi] token %s: %s: %v", addrHex, labels[i], callErr)
+			}
+		}
+	} else if err != nil {
+		return tokenMeta{}, err
+	}
+	ok := func(i int) bool { return i >= len(callErrs) || callErrs[i] == nil }
+
+	var meta tokenMeta
+	if ok(0) {
+		meta.name = strings.TrimSpace(name)
+	}
+	if ok(1) {
+		meta.symbol = strings.TrimSpace(symbol)
+	}
+	if ok(2) {
+		meta.decimals = sql.NullInt64{Int64: int64(decimals), Valid: true}
+	}
+	return meta, nil
 }
 
 // eventCoins is the coin list taken from the deployment event itself, used when

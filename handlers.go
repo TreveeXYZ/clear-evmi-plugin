@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 
 	exporter "github.com/evmi-cloud/go-evm-indexer/pkg/exporter"
@@ -34,6 +35,75 @@ ON CONFLICT (chain_id, address) DO UPDATE SET last_block = GREATEST(clear_iou_to
 	return err
 }
 
+// ensureToken registers an ERC20 in clear_tokens, reading its name/symbol/decimals
+// off the chain the first time it is seen. It is called wherever a token address
+// ENTERS the schema — a reserve's assets and their IOUs (AssetAdded), a reserve's
+// own LP token and its token set (NewClearReserve), a Curve pool's LP token and
+// the coins it pairs (PoolDeployed / Plain- & MetaPoolDeployed).
+//
+// The row is claimed first, and only the writer that actually inserted it goes on
+// to spend an RPC round trip: a token already listed costs one indexed no-op
+// INSERT and nothing else, which is what makes this safe to call from a hot path.
+// The claim lives in the caller's transaction, so if the event later fails it
+// rolls back with everything else and the token is fetched again on redelivery —
+// no half-written row survives.
+//
+// hints are the fields the discovery event already carries; a complete set skips
+// the fetch, and anything the getters do not answer falls back to them.
+func (e *clearExporter) ensureToken(tx *sql.Tx, chainID uint64, addr string, block uint64, hints tokenMeta) error {
+	addr = normAddr(addr)
+	if addr == "" || isZeroAddr(addr) {
+		return nil
+	}
+
+	var first sql.NullInt64
+	if block > 0 {
+		first = sql.NullInt64{Int64: int64(block), Valid: true}
+	}
+	res, err := tx.Exec(`INSERT INTO clear_tokens (chain_id, address, first_block)
+VALUES ($1, $2, $3) ON CONFLICT (chain_id, address) DO NOTHING`, chainID, addr, first)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	created := n > 0
+
+	meta := hints
+	if created && e.rpc != nil && !meta.complete() {
+		// A request-level failure is returned rather than swallowed: it fails the
+		// event, the claim rolls back with it, and EVMI redelivers — otherwise a
+		// blank row would stand for good and never be retried.
+		fetched, err := fetchTokenMeta(e.rpc, addr)
+		if err != nil {
+			return fmt.Errorf("token %s: %w", addr, err)
+		}
+		meta = fetched.withFallback(hints)
+	}
+	if !created && meta.empty() {
+		return nil // already known, and this call has nothing to add
+	}
+
+	// Patch only what is still missing, so a later event can fill a gap the
+	// getters left — a token whose name()/symbol()/decimals() revert still gets
+	// its decimals from the AssetAdded that names it, whichever came first.
+	return exec(tx, `UPDATE clear_tokens SET
+  name     = COALESCE(name, NULLIF($3::text, '')),
+  symbol   = COALESCE(symbol, NULLIF($4::text, '')),
+  decimals = COALESCE(decimals, $5)
+WHERE chain_id = $1 AND address = $2`,
+		chainID, addr, meta.name, meta.symbol, meta.decimals)
+}
+
+// ensureTokens registers a list of tokens, skipping empty/zero entries.
+func (e *clearExporter) ensureTokens(tx *sql.Tx, chainID uint64, addrs []string, block uint64) error {
+	for _, addr := range addrs {
+		if err := e.ensureToken(tx, chainID, addr, block, tokenMeta{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func exec(tx *sql.Tx, q string, args ...any) error {
 	_, err := tx.Exec(q, args...)
 	return err
@@ -45,6 +115,16 @@ func nullNum(args map[string]string, key string) sql.NullString {
 		return sql.NullString{String: v, Valid: true}
 	}
 	return sql.NullString{}
+}
+
+// nullInt is nullNum for a small integer arg (an ERC20 `decimals`), NULL when the
+// arg is absent or not a plain number.
+func nullInt(args map[string]string, key string) sql.NullInt64 {
+	v, err := strconv.ParseInt(strings.TrimSpace(args[key]), 10, 64)
+	if err != nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: v, Valid: true}
 }
 
 // --- ERC20 Transfer (reserve LP / IOU / curve LP), routed by contract kind ---
@@ -438,9 +518,10 @@ ON CONFLICT (id) DO NOTHING`,
 		log.ChainId, reserve, log.BlockNumber)
 }
 
-func handleAssetAdded(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
+func (e *clearExporter) handleAssetAdded(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	a := log.Args
 	reserve := normAddr(log.Address)
+	asset := normAddr(a["asset"])
 	iou := normAddr(a["iou"])
 	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
@@ -449,6 +530,19 @@ func handleAssetAdded(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 		if err := ensureIou(tx, log.ChainId, iou, log.BlockNumber); err != nil {
 			return err
 		}
+	}
+
+	// The asset and the IOU minted against it both enter the schema here. The
+	// event already states the asset's decimals, so that one field never needs a
+	// getter even when the token does not implement decimals().
+	if err := e.ensureToken(tx, log.ChainId, asset, log.BlockNumber, tokenMeta{decimals: nullInt(a, "decimals")}); err != nil {
+		return err
+	}
+	if err := e.ensureToken(tx, log.ChainId, iou, log.BlockNumber, tokenMeta{}); err != nil {
+		return err
+	}
+	if err := e.ensureToken(tx, log.ChainId, reserve, log.BlockNumber, tokenMeta{}); err != nil {
+		return err
 	}
 	// position = current asset count for the reserve, so it mirrors the contract's
 	// append-only assetList index; kept unchanged on a re-emit (assets are added once).
@@ -461,7 +555,7 @@ func handleAssetAdded(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 VALUES ($1, $2, $3, $4, $5, (SELECT count(*) FROM clear_reserve_assets WHERE chain_id = $1 AND reserve = $2), $6)
 ON CONFLICT (chain_id, reserve, asset) DO UPDATE SET
   decimals = EXCLUDED.decimals, iou = EXCLUDED.iou, weight = EXCLUDED.weight`,
-		log.ChainId, reserve, normAddr(a["asset"]), nullNum(a, "decimals"), nullEmpty(iou), nullNum(a, "weight"))
+		log.ChainId, reserve, asset, nullNum(a, "decimals"), nullEmpty(iou), nullNum(a, "weight"))
 }
 
 // --- curve pool events ---
@@ -728,6 +822,19 @@ func (e *clearExporter) handleNewClearReserve(tx *sql.Tx, log exporter.LogEvent)
 	if err != nil {
 		return err
 	}
+	// The reserve's LP token is the reserve itself, and the factory names it here;
+	// its underlying token set enters the schema at the same time.
+	if err := e.ensureToken(tx, log.ChainId, reserve, log.BlockNumber,
+		tokenMeta{name: a["name"], symbol: a["symbol"]}); err != nil {
+		return err
+	}
+	reserveTokens, err := splitArrayArg(a["tokens"])
+	if err != nil {
+		return fmt.Errorf("NewClearReserve %s tokens: %w", log.Id, err)
+	}
+	if err := e.ensureTokens(tx, log.ChainId, reserveTokens, log.BlockNumber); err != nil {
+		return err
+	}
 	if err := exec(tx, `UPDATE clear_reserves
 SET name = $3, symbol = $4, implementation = $5, reserve_index = $6, tokens = $7, factory = $8
 WHERE chain_id = $1 AND address = $2`,
@@ -792,6 +899,10 @@ SET reserve = $3, base_pool = $4, coin = $5, is_base_pool = $6, deployer = $7
 WHERE chain_id = $1 AND address = $2`,
 		log.ChainId, pool, nullEmpty(normAddr(a["reserve"])), nullEmpty(normAddr(a["basePool"])),
 		nullEmpty(coin), isBase, normAddr(log.Address)); err != nil {
+		return err
+	}
+	// The pool's LP token IS the pool, and `coin` is the asset the metapool pairs.
+	if err := e.ensureTokens(tx, log.ChainId, []string{pool, coin}, log.BlockNumber); err != nil {
 		return err
 	}
 	return e.trackContract(tx, log.ChainId, pool, curveKind, log.BlockNumber)
@@ -885,6 +996,16 @@ WHERE chain_id = $1 AND address = $2`,
 		info.name, info.symbol, info.decimals, info.implementation,
 		coinsJSON, nCoins,
 		normAddr(a["deployer"]), normAddr(a["base_pool"]), normAddr(a["coin"])); err != nil {
+		return err
+	}
+
+	// The pool's LP token IS the pool, and its metadata was just read back, so
+	// this costs no extra RPC. The coins it pairs enter the schema here too.
+	if err := e.ensureToken(tx, log.ChainId, pool, log.BlockNumber,
+		tokenMeta{name: info.name, symbol: info.symbol, decimals: info.decimals}); err != nil {
+		return err
+	}
+	if err := e.ensureTokens(tx, log.ChainId, coins, log.BlockNumber); err != nil {
 		return err
 	}
 

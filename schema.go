@@ -313,6 +313,8 @@ CREATE TABLE IF NOT EXISTS clear_reserve_value_history (
     total_supply    NUMERIC,
     PRIMARY KEY (chain_id, reserve, day)
 );
+ALTER TABLE clear_reserve_value_history ADD COLUMN IF NOT EXISTS iou_debt NUMERIC;
+ALTER TABLE clear_reserve_value_history ADD COLUMN IF NOT EXISTS nav NUMERIC;
 
 -- Curve StableSwap-NG pools (IOU secondary market; LP token IS the pool).
 -- reserve/base_pool/coin/is_base_pool/deployer come from the ClearCurvePoolDeployer's
@@ -419,4 +421,75 @@ CREATE TABLE IF NOT EXISTS clear_curve_liquidity (
     token_supply  NUMERIC
 );
 CREATE INDEX IF NOT EXISTS clear_curve_liquidity_pool_block ON clear_curve_liquidity (chain_id, pool, block_number);
+
+-- Reserve valuation, in normalized 18-decimal par units. Two layers, because a
+-- meta reserve's BaseLP leg is priced at the BASE reserve's NAV/share and the
+-- base reserve therefore has to be valued first. Dropped and recreated on every
+-- migration so a column change is not a manual step (CREATE OR REPLACE VIEW
+-- refuses one).
+--
+-- Layer 1 values every leg at par. That IS the definition for a base reserve
+-- (ClearBaseReserve.totalAssets / totalIOUDebt / totalReserveValue); for a meta
+-- reserve it is only an intermediate and layer 2 replaces it.
+DROP VIEW IF EXISTS clear_reserve_values CASCADE;
+DROP VIEW IF EXISTS clear_reserve_par_values CASCADE;
+CREATE VIEW clear_reserve_par_values AS
+SELECT
+    r.chain_id,
+    r.address,
+    r.kind,
+    r.lp_supply,
+    COALESCE(g.value, 0) AS gross_assets,
+    COALESCE(d.value, 0) AS iou_debt,
+    GREATEST(COALESCE(g.value, 0) - COALESCE(d.value, 0), 0) AS nav
+FROM clear_reserves r
+LEFT JOIN LATERAL (
+    SELECT sum(b.balance * power(10::numeric, 18 - COALESCE(a.decimals, 18))) AS value
+    FROM clear_reserve_token_balances b
+    JOIN clear_reserve_assets a
+      ON a.chain_id = b.chain_id AND a.reserve = b.reserve AND a.asset = b.asset
+    WHERE b.chain_id = r.chain_id AND b.reserve = r.address
+) g ON TRUE
+LEFT JOIN LATERAL (
+    SELECT sum(COALESCE(a.iou_supply, 0) * power(10::numeric, 18 - COALESCE(a.decimals, 18))) AS value
+    FROM clear_reserve_assets a
+    WHERE a.chain_id = r.chain_id AND a.reserve = r.address
+) d ON TRUE;
+
+-- Layer 2 is the figure each contract actually reports. For a meta reserve the
+-- native leg stays at par (ClearMetaReserve.nativeValue) while the BaseLP leg —
+-- the leg whose asset IS a base reserve — is converted at that reserve's NAV/share
+-- (baseLpValue -> IClearBaseReserve.convertToValue), including the +1/+1 virtual
+-- offset the contract prices shares with. Its IOU debt is netted the same way.
+-- Multiply before dividing and trunc() the quotient, so the result matches the
+-- contract's integer arithmetic exactly rather than drifting by a rounding step.
+CREATE VIEW clear_reserve_values AS
+SELECT
+    p.chain_id,
+    p.address,
+    p.kind,
+    p.lp_supply,
+    CASE WHEN p.kind = 'meta' THEN COALESCE(m.gross_assets, 0) ELSE p.gross_assets END AS gross_assets,
+    CASE WHEN p.kind = 'meta' THEN COALESCE(m.iou_debt, 0) ELSE p.iou_debt END AS iou_debt,
+    CASE WHEN p.kind = 'meta'
+         THEN GREATEST(COALESCE(m.gross_assets, 0) - COALESCE(m.iou_debt, 0), 0)
+         ELSE p.nav END AS nav
+FROM clear_reserve_par_values p
+LEFT JOIN LATERAL (
+    SELECT
+        sum(CASE WHEN base.address IS NULL
+                 THEN COALESCE(b.balance, 0) * power(10::numeric, 18 - COALESCE(a.decimals, 18))
+                 ELSE trunc(COALESCE(b.balance, 0) * (base.nav + 1) / (base.lp_supply + 1))
+            END) AS gross_assets,
+        sum(CASE WHEN base.address IS NULL
+                 THEN COALESCE(a.iou_supply, 0) * power(10::numeric, 18 - COALESCE(a.decimals, 18))
+                 ELSE trunc(COALESCE(a.iou_supply, 0) * (base.nav + 1) / (base.lp_supply + 1))
+            END) AS iou_debt
+    FROM clear_reserve_assets a
+    LEFT JOIN clear_reserve_token_balances b
+      ON b.chain_id = a.chain_id AND b.reserve = a.reserve AND b.asset = a.asset
+    LEFT JOIN clear_reserve_par_values base
+      ON base.chain_id = a.chain_id AND base.address = a.asset AND base.kind = 'base'
+    WHERE a.chain_id = p.chain_id AND a.reserve = p.address
+) m ON p.kind = 'meta';
 `

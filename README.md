@@ -25,10 +25,11 @@ registered for indexing through the host API — see
 | `clear_reserve_settings` | per reserve: every governance parameter, folded from the `set*` events (fees, distributions, swap-spread window, rebalance trigger, deposit-weight tolerance) |
 | `clear_reserve_lp_balances` | `(reserve, holder) → balance` — every LP holder |
 | `clear_reserve_assets` | reserve's assets + their IOU token and `iou_supply` (from `AssetAdded`); for a **meta** reserve, its two legs with each leg's target `weight` in bps |
-| `clear_reserve_token_balances` | a **base** reserve's physical ERC20 holdings per asset, reconstructed from event token-flows |
+| `clear_reserve_token_balances` | a reserve's physical ERC20 holdings per asset (base reserves per asset, meta reserves per leg), reconstructed from event token-flows |
 | `clear_reserve_swaps` | depeg `Swap` history (amounts + IOU split) |
 | `clear_reserve_activity` | deposits, withdrawals, single-asset ops, rebalances, IOU mint/redeem, flash loans |
-| `clear_reserve_value_history` | daily end-of-day `total_assets` / `total_supply` per base reserve (for TVL charts) |
+| `clear_reserve_value_history` | daily end-of-day `total_assets` / `iou_debt` / `nav` / `total_supply` per reserve, both types (for TVL and share-price charts) |
+| `clear_reserve_par_values`, `clear_reserve_values` | *views* — live reserve valuation mirroring each contract's own views; a meta reserve's BaseLP leg is priced at the base reserve's NAV/share |
 | `clear_iou_tokens` / `clear_iou_balances` | IOU supply, cumulative `treasury_fees`, and per-holder balances |
 | `clear_oracle_prices` | per asset: price, redemption price, TTL, decimals, enabled, last refresh — folded from `ClearOracle` + `PythOracleAdapter` |
 | `clear_oracle_price_history` | every `ClearOracleRateChanged` as a price point (for charts) |
@@ -220,12 +221,15 @@ GROUP BY p.address, p.lp_supply;
 
 ## Notes / limitations
 
-- **Reserve on-chain token holdings** are reconstructed for **base** reserves only
-  (`clear_reserve_token_balances`), by applying every event's token-flow as a signed delta —
-  exact only when indexing starts at the reserve's deployment. A **meta** reserve's holdings are
-  not: it now emits `AssetAdded` per leg, so its legs are registered, but its balanced
-  `Deposit`/`Withdraw` carry named scalars (`baseLpIn`/`nativeIn`) with nothing tying a scalar to
-  a leg address.
+- **Reserve on-chain token holdings** (`clear_reserve_token_balances`) are reconstructed for both
+  reserve types by applying every event's token-flow as a signed delta — exact only when indexing
+  starts at the reserve's deployment. A meta reserve's `Deposit`/`Withdraw` names no address (it
+  carries `baseLpIn`/`nativeIn` scalars), so its legs are resolved first: the BaseLP leg is the one
+  whose asset **is** a base reserve, the native leg is the other.
+- **A meta reserve's value follows the base reserve's NAV**, so its `clear_reserve_value_history`
+  row is only refreshed when the *meta* reserve itself emits an event. Between two meta events a
+  base-side move leaves the stored figure stale — inherent to daily event-driven snapshots. The
+  `clear_reserve_values` view is always live.
 - **Reserve settings** are only observable once a `set*` function is actually called — the
   contract defaults are not emitted at `initialize`, so a column in `clear_reserve_settings` stays
   NULL until then (see `RESERVE-SETTINGS.md` in the contracts repo for the defaults).

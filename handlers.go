@@ -232,6 +232,74 @@ func reserveAssetsByPosition(tx *sql.Tx, chainID uint64, reserve string) (map[in
 // `amounts` array, aligned with assetList order. `negate` flips the sign for
 // withdrawals. An index whose asset is unknown (AssetAdded missed because indexing
 // started late) is skipped — its balance would be wrong anyway.
+// metaLegs resolves a meta reserve's two legs to their asset addresses. The
+// BaseLP leg is the one whose asset IS a base reserve — a lookup rather than a
+// convention, so it does not depend on the order AssetAdded happened to be
+// emitted in. Position order (native first, then BaseLP) is the fallback for a
+// reserve whose base leg is not indexed yet. Either may come back empty; the
+// caller's adjustTokenBalance then no-ops rather than mis-attributing an amount.
+func metaLegs(tx *sql.Tx, chainID uint64, reserve string) (native, baseLp string, err error) {
+	rows, err := tx.Query(`SELECT a.asset, (r.address IS NOT NULL) AS is_base_lp
+FROM clear_reserve_assets a
+LEFT JOIN clear_reserves r
+  ON r.chain_id = a.chain_id AND r.address = a.asset AND r.kind = 'base'
+WHERE a.chain_id = $1 AND a.reserve = $2
+ORDER BY a.position`, chainID, reserve)
+	if err != nil {
+		return "", "", err
+	}
+	defer rows.Close()
+
+	var ordered []string
+	for rows.Next() {
+		var asset string
+		var isBaseLp bool
+		if err := rows.Scan(&asset, &isBaseLp); err != nil {
+			return "", "", err
+		}
+		ordered = append(ordered, asset)
+		if isBaseLp {
+			baseLp = asset
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", err
+	}
+
+	switch {
+	case baseLp != "":
+		for _, asset := range ordered {
+			if asset != baseLp {
+				native = asset
+				break
+			}
+		}
+	case len(ordered) == 2:
+		native, baseLp = ordered[0], ordered[1]
+	}
+	return native, baseLp, nil
+}
+
+// applyMetaAmounts moves a meta reserve's two legs by the named scalars its
+// Deposit/Withdraw carries (baseLpIn/nativeIn, baseLpOut/nativeOut). Unlike the
+// base reserve's positional `amounts[]`, nothing in the event names an address,
+// so the legs are resolved from clear_reserve_assets first.
+func applyMetaAmounts(tx *sql.Tx, chainID uint64, reserve string, args map[string]string, negate bool, block uint64) error {
+	native, baseLp, err := metaLegs(tx, chainID, reserve)
+	if err != nil {
+		return err
+	}
+	nativeAmt := numOrZero(firstArg(args, "nativeIn", "nativeOut"))
+	baseLpAmt := numOrZero(firstArg(args, "baseLpIn", "baseLpOut"))
+	if negate {
+		nativeAmt, baseLpAmt = neg(nativeAmt), neg(baseLpAmt)
+	}
+	if err := adjustTokenBalance(tx, chainID, reserve, native, nativeAmt, block); err != nil {
+		return err
+	}
+	return adjustTokenBalance(tx, chainID, reserve, baseLp, baseLpAmt, block)
+}
+
 func applyReserveAmounts(tx *sql.Tx, chainID uint64, reserve, amountsArg string, negate bool, block uint64) error {
 	amounts, err := splitArrayArg(amountsArg)
 	if err != nil {
@@ -268,17 +336,17 @@ func applyReserveAmounts(tx *sql.Tx, chainID uint64, reserve, amountsArg string,
 // only. Call it after this event's balances/supply are applied.
 func snapshotReserveValue(tx *sql.Tx, reserve string, log exporter.LogEvent) error {
 	_, err := tx.Exec(`INSERT INTO clear_reserve_value_history
-(chain_id, reserve, day, block_number, block_timestamp, total_assets, total_supply)
-SELECT $4, $1, (to_timestamp($2) AT TIME ZONE 'UTC')::date, $3, $2,
-  COALESCE((SELECT sum(b.balance * power(10::numeric, 18 - COALESCE(a.decimals, 18)))
-            FROM clear_reserve_token_balances b
-            JOIN clear_reserve_assets a ON a.chain_id = b.chain_id AND a.reserve = b.reserve AND a.asset = b.asset
-            WHERE b.chain_id = $4 AND b.reserve = $1), 0),
-  COALESCE((SELECT lp_supply FROM clear_reserves WHERE chain_id = $4 AND address = $1), 0)
+(chain_id, reserve, day, block_number, block_timestamp, total_assets, iou_debt, nav, total_supply)
+SELECT v.chain_id, v.address, (to_timestamp($2) AT TIME ZONE 'UTC')::date, $3, $2,
+       v.gross_assets, v.iou_debt, v.nav, v.lp_supply
+FROM clear_reserve_values v
+WHERE v.chain_id = $4 AND v.address = $1
 ON CONFLICT (chain_id, reserve, day) DO UPDATE SET
   block_number = EXCLUDED.block_number,
   block_timestamp = EXCLUDED.block_timestamp,
   total_assets = EXCLUDED.total_assets,
+  iou_debt = EXCLUDED.iou_debt,
+  nav = EXCLUDED.nav,
   total_supply = EXCLUDED.total_supply
 WHERE clear_reserve_value_history.block_number <= EXCLUDED.block_number`,
 		reserve, log.BlockTimestamp, log.BlockNumber, log.ChainId)
@@ -320,13 +388,17 @@ func handleReserveDeposit(tx *sql.Tx, log exporter.LogEvent, k contractKind) err
 		firstArg(a, "baseLpIn", "lpMinted"), num(a, "nativeIn"), "0", numOrZero(lp)); err != nil {
 		return err
 	}
-	if k == baseReserveKind {
-		if err := applyReserveAmounts(tx, log.ChainId, reserve, a["amounts"], false, log.BlockNumber); err != nil {
+	// A base reserve carries a positional amounts[] aligned with its assetList; a
+	// meta reserve carries named per-leg scalars instead (see applyMetaAmounts).
+	if k == metaReserveKind {
+		if err := applyMetaAmounts(tx, log.ChainId, reserve, a, false, log.BlockNumber); err != nil {
 			return err
 		}
-		if err := snapshotReserveValue(tx, reserve, log); err != nil {
-			return err
-		}
+	} else if err := applyReserveAmounts(tx, log.ChainId, reserve, a["amounts"], false, log.BlockNumber); err != nil {
+		return err
+	}
+	if err := snapshotReserveValue(tx, reserve, log); err != nil {
+		return err
 	}
 	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "total_deposits", numOrZero(lp), log.BlockNumber)
 }
@@ -340,13 +412,15 @@ func handleReserveWithdraw(tx *sql.Tx, log exporter.LogEvent, k contractKind) er
 		firstArg(a, "baseLpOut", "lpBurned"), num(a, "nativeOut"), "0", numOrZero(lp)); err != nil {
 		return err
 	}
-	if k == baseReserveKind {
-		if err := applyReserveAmounts(tx, log.ChainId, reserve, a["amounts"], true, log.BlockNumber); err != nil {
+	if k == metaReserveKind {
+		if err := applyMetaAmounts(tx, log.ChainId, reserve, a, true, log.BlockNumber); err != nil {
 			return err
 		}
-		if err := snapshotReserveValue(tx, reserve, log); err != nil {
-			return err
-		}
+	} else if err := applyReserveAmounts(tx, log.ChainId, reserve, a["amounts"], true, log.BlockNumber); err != nil {
+		return err
+	}
+	if err := snapshotReserveValue(tx, reserve, log); err != nil {
+		return err
 	}
 	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "total_withdrawals", numOrZero(lp), log.BlockNumber)
 }
@@ -360,18 +434,17 @@ func handleSingleAssetDeposit(tx *sql.Tx, log exporter.LogEvent, k contractKind)
 		num(a, "amountIn"), "0", num(a, "fee"), numOrZero(lp)); err != nil {
 		return err
 	}
-	if k == baseReserveKind {
-		// amountIn pulled in; fee forwarded to treasury — net (amountIn - fee) stays.
-		asset := normAddr(a["asset"])
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, num(a, "amountIn"), log.BlockNumber); err != nil {
-			return err
-		}
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
-			return err
-		}
-		if err := snapshotReserveValue(tx, reserve, log); err != nil {
-			return err
-		}
+	// amountIn pulled in; fee forwarded to treasury — net (amountIn - fee) stays.
+	// Both reserve types name the asset here, so both are tracked.
+	asset := normAddr(a["asset"])
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, num(a, "amountIn"), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := snapshotReserveValue(tx, reserve, log); err != nil {
+		return err
 	}
 	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "total_deposits", numOrZero(lp), log.BlockNumber)
 }
@@ -385,18 +458,16 @@ func handleSingleAssetWithdraw(tx *sql.Tx, log exporter.LogEvent, k contractKind
 		num(a, "amountOut"), "0", num(a, "fee"), numOrZero(lp)); err != nil {
 		return err
 	}
-	if k == baseReserveKind {
-		// amountOut sent to receiver and fee to treasury both leave the reserve.
-		asset := normAddr(a["asset"])
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, neg(num(a, "amountOut")), log.BlockNumber); err != nil {
-			return err
-		}
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
-			return err
-		}
-		if err := snapshotReserveValue(tx, reserve, log); err != nil {
-			return err
-		}
+	// amountOut sent to receiver and fee to treasury both leave the reserve.
+	asset := normAddr(a["asset"])
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, neg(num(a, "amountOut")), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, neg(num(a, "fee")), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := snapshotReserveValue(tx, reserve, log); err != nil {
+		return err
 	}
 	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "total_withdrawals", numOrZero(lp), log.BlockNumber)
 }
@@ -407,16 +478,14 @@ func handleRebalanced(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
 	}
-	if k == baseReserveKind {
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenIn"]), num(a, "amountIn"), log.BlockNumber); err != nil {
-			return err
-		}
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
-			return err
-		}
-		if err := snapshotReserveValue(tx, reserve, log); err != nil {
-			return err
-		}
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenIn"]), num(a, "amountIn"), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := snapshotReserveValue(tx, reserve, log); err != nil {
+		return err
 	}
 	return insertActivity(tx, log, reserve, "rebalance",
 		normAddr(a["caller"]), normAddr(a["recipient"]), normAddr(a["tokenIn"]),
@@ -429,14 +498,12 @@ func handleFlashLoan(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
 	}
-	if k == baseReserveKind {
-		// Principal is lent and returned within the tx; only the fee stays in the reserve.
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["token"]), num(a, "fee"), log.BlockNumber); err != nil {
-			return err
-		}
-		if err := snapshotReserveValue(tx, reserve, log); err != nil {
-			return err
-		}
+	// Principal is lent and returned within the tx; only the fee stays in the reserve.
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["token"]), num(a, "fee"), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := snapshotReserveValue(tx, reserve, log); err != nil {
+		return err
 	}
 	return insertActivity(tx, log, reserve, "flash_loan",
 		normAddr(a["initiator"]), normAddr(a["receiver"]), normAddr(a["token"]),
@@ -452,14 +519,12 @@ func handleIOUMinted(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 		amount, "0", "0", "0"); err != nil {
 		return err
 	}
-	if k == baseReserveKind {
-		// mintIOU pulls `amount` of the underlying into the reserve (1:1 backing).
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["asset"]), amount, log.BlockNumber); err != nil {
-			return err
-		}
-		if err := snapshotReserveValue(tx, reserve, log); err != nil {
-			return err
-		}
+	// mintIOU pulls `amount` of the underlying into the reserve (1:1 backing).
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["asset"]), amount, log.BlockNumber); err != nil {
+		return err
+	}
+	if err := snapshotReserveValue(tx, reserve, log); err != nil {
+		return err
 	}
 	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "iou_minted", amount, log.BlockNumber)
 }
@@ -473,14 +538,12 @@ func handleIOURedeemed(tx *sql.Tx, log exporter.LogEvent, k contractKind) error 
 		amount, "0", "0", "0"); err != nil {
 		return err
 	}
-	if k == baseReserveKind {
-		// redeemIOU pays out `amount` of the underlying (par settlement, 1:1).
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["asset"]), neg(amount), log.BlockNumber); err != nil {
-			return err
-		}
-		if err := snapshotReserveValue(tx, reserve, log); err != nil {
-			return err
-		}
+	// redeemIOU pays out `amount` of the underlying (par settlement, 1:1).
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["asset"]), neg(amount), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := snapshotReserveValue(tx, reserve, log); err != nil {
+		return err
 	}
 	return bumpReserve(tx, log.ChainId, reserve, k.reserveType(), "iou_redeemed", amount, log.BlockNumber)
 }
@@ -501,18 +564,16 @@ ON CONFLICT (id) DO NOTHING`,
 		num(a, "amountIn"), num(a, "amountOut"), num(a, "iouTotal"), num(a, "traderIOU"), num(a, "treasuryIOU"), num(a, "lpIOU")); err != nil {
 		return err
 	}
-	if k == baseReserveKind {
-		// amountIn of tokenIn received, amountOut of tokenOut paid out. The IOU
-		// shortfall is a claim minted against NAV, not an underlying-token movement.
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenIn"]), num(a, "amountIn"), log.BlockNumber); err != nil {
-			return err
-		}
-		if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
-			return err
-		}
-		if err := snapshotReserveValue(tx, reserve, log); err != nil {
-			return err
-		}
+	// amountIn of tokenIn received, amountOut of tokenOut paid out. The IOU
+	// shortfall is a claim minted against NAV, not an underlying-token movement.
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenIn"]), num(a, "amountIn"), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, normAddr(a["tokenOut"]), neg(num(a, "amountOut")), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := snapshotReserveValue(tx, reserve, log); err != nil {
+		return err
 	}
 	return exec(tx, `UPDATE clear_reserves SET swap_count = swap_count + 1, last_block = $3 WHERE chain_id = $1 AND address = $2`,
 		log.ChainId, reserve, log.BlockNumber)

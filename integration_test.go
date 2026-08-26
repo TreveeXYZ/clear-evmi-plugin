@@ -417,6 +417,25 @@ func TestReplayProtocol(t *testing.T) {
 			"coins": "[" + poolCoinA + " " + poolCoinB + "]", "A": "200", "fee": "1000000", "deployer": deployer}),
 		mkLog(112, 1, CURVEFACTORY, curveFactoryAddr, "MetaPoolDeployed", map[string]string{
 			"coin": poolCoinA, "base_pool": plainPool, "A": "500", "fee": "4000000", "deployer": deployer}),
+
+		// Meta reserve flows. Deposit/Withdraw carry NAMED per-leg scalars instead of
+		// the base reserve's positional amounts[], so the legs are resolved from
+		// clear_reserve_assets: the BaseLP leg is the one whose asset is a base
+		// reserve, the native leg is the other.
+		mkLog(113, 0, META, metaReserve, "Transfer", map[string]string{"from": zeroAddr, "to": alice, "value": "1000"}),
+		mkLog(113, 1, META, metaReserve, "Deposit", map[string]string{
+			"caller": alice, "receiver": alice, "baseLpIn": "800", "nativeIn": "200", "metaLpMinted": "1000"}),
+		// A single-asset op names its asset outright — the same shape as the base
+		// reserve's, which is why it needs no leg resolution.
+		mkLog(113, 2, META, metaReserve, "SingleAssetDeposit", map[string]string{
+			"caller": bob, "receiver": bob, "asset": nativeTok, "amountIn": "50", "fee": "1", "metaLpMinted": "48"}),
+		mkLog(113, 3, META, metaReserve, "Transfer", map[string]string{"from": zeroAddr, "to": bob, "value": "48"}),
+		// mintIOU pulls the native leg in 1:1 and mints the leg's IOU against it. The
+		// IOU's own Transfer comes first, the order mintIOU emits them in, so the
+		// snapshot IOUMinted takes already nets out the new debt.
+		mkLog(114, 0, IOU, metaIou1, "Transfer", map[string]string{"from": zeroAddr, "to": bob, "value": "10"}),
+		mkLog(114, 1, META, metaReserve, "IOUMinted", map[string]string{
+			"caller": bob, "asset": nativeTok, "receiver": bob, "amount": "10"}),
 	}
 
 	for _, l := range logs {
@@ -452,11 +471,40 @@ func TestReplayProtocol(t *testing.T) {
 	// events collapse into a single row holding the end-of-day (last, block 103)
 	// value. total_assets is par-valued 18-dec: (1525 + 1335) 6-dec * 10^12 = 2.86e15;
 	// total_supply 1450.
+	// iou_debt is the assets' IOU supply at par (usdc's IOU minted 5, 6-dec → 5e12);
+	// nav = gross − debt, the denominator the contract prices LP shares with.
 	eq(t, db, "reserve daily value", `SELECT count(*) FROM clear_reserve_value_history
 		WHERE reserve=$1 AND day=(to_timestamp($2) AT TIME ZONE 'UTC')::date AND block_number=103
-		AND total_assets=2860000000000000 AND total_supply=1450`, reserve, blockTs(103))
+		AND total_assets=2860000000000000 AND iou_debt=5000000000000
+		AND nav=2855000000000000 AND total_supply=1450`, reserve, blockTs(103))
 	if got := count(t, db, `SELECT count(*) FROM clear_reserve_value_history WHERE reserve=$1`, reserve); got != 1 {
 		t.Errorf("reserve daily rows = %d, want 1 (all events same day)", got)
+	}
+
+	// --- meta reserve: legs, physical balances, and NAV-priced value ---
+	// native leg = nativeTok (6-dec), BaseLP leg = the base reserve itself.
+	//   native  = 200(deposit) + 50 - 1(single-asset fee) + 10(iou mint) = 259
+	//   base LP = 800(deposit)
+	eq(t, db, "meta native leg holdings", `SELECT count(*) FROM clear_reserve_token_balances
+		WHERE reserve=$1 AND asset=$2 AND balance=259`, metaReserve, nativeTok)
+	eq(t, db, "meta baseLP leg holdings", `SELECT count(*) FROM clear_reserve_token_balances
+		WHERE reserve=$1 AND asset=$2 AND balance=800`, metaReserve, reserve)
+	// The BaseLP leg is NOT valued at par: it is converted at the base reserve's
+	// NAV/share, with the contract's +1/+1 virtual offset and integer truncation
+	// (ClearMetaReserve.baseLpValue -> ClearBaseReserve.convertToValue). The base
+	// figures below are the ones asserted above, so this does not consult the view.
+	//   gross = 259 * 10^12  +  trunc(800 * (2855e12 + 1) / (1450 + 1))
+	//   debt  = the native IOU's 10 at par; the BaseLP leg's IOU is untouched
+	eq(t, db, "meta daily value", `SELECT count(*) FROM clear_reserve_value_history
+		WHERE reserve=$1 AND block_number=114 AND total_supply=1048
+		AND total_assets = 259 * 1000000000000 + trunc(800 * (2855000000000000 + 1) / (1450 + 1))
+		AND iou_debt = 10 * 1000000000000
+		AND nav = total_assets - iou_debt`, metaReserve)
+	// Par-valuing the BaseLP leg would have given 800 flat instead of ~1.5e15, so
+	// the row must be far above the par figure.
+	if n := count(t, db, `SELECT count(*) FROM clear_reserve_value_history
+		WHERE reserve=$1 AND total_assets > 259 * 1000000000000 + 1000000000`, metaReserve); n != 1 {
+		t.Error("meta total_assets looks par-valued: the BaseLP leg was not converted at the base reserve's NAV")
 	}
 
 	// asset registry + IOU; position mirrors assetList order and drives amounts[] mapping.
@@ -475,10 +523,14 @@ func TestReplayProtocol(t *testing.T) {
 	if got := count(t, db, `SELECT count(*) FROM clear_reserve_swaps`); got != 1 {
 		t.Errorf("reserve swaps = %d, want 1", got)
 	}
-	// activity: deposit x2, iou_minted x1, withdraw x1, single_deposit x1, rebalance x1
-	// (Swap is NOT activity).
-	if got := count(t, db, `SELECT count(*) FROM clear_reserve_activity`); got != 6 {
-		t.Errorf("reserve activity rows = %d, want 6", got)
+	// activity, base reserve: deposit x2, iou_minted x1, withdraw x1,
+	// single_deposit x1, rebalance x1 (Swap is NOT activity); meta reserve adds
+	// deposit x1, single_deposit x1, iou_minted x1.
+	if got := count(t, db, `SELECT count(*) FROM clear_reserve_activity WHERE reserve=$1`, reserve); got != 6 {
+		t.Errorf("base reserve activity rows = %d, want 6", got)
+	}
+	if got := count(t, db, `SELECT count(*) FROM clear_reserve_activity WHERE reserve=$1`, metaReserve); got != 3 {
+		t.Errorf("meta reserve activity rows = %d, want 3", got)
 	}
 	eq(t, db, "withdraw activity", `SELECT count(*) FROM clear_reserve_activity WHERE action='withdraw' AND caller=$1 AND lp=100`, alice)
 

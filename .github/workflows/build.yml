@@ -1,0 +1,43 @@
+# Copy to .github/workflows/build.yml — builds ON RELEASE, deploys nothing.
+#
+# Per-repo values:
+#   clear-rfq-api → SERVICE=rfq-api        clear-app-api → SERVICE=app-api
+#   clear-rebalancer → SERVICE=rebalancer  clear-keepers → SERVICE=oracle-keeper
+#   clear-evmi-plugin → SERVICE=evmi
+# WIF_PROVIDER and DEPLOYER_SA come from `terraform output` in clear-infra.
+name: build
+
+on:
+  release:
+    types: [published]
+
+env:
+  SERVICE: evmi
+  REGISTRY: europe-west1-docker.pkg.dev/clear-prod/clear
+  WIF_PROVIDER: projects/1080703084772/locations/global/workloadIdentityPools/github/providers/github-oidc
+  DEPLOYER_SA: clear-deployer@clear-prod.iam.gserviceaccount.com
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push the release image
+        run: |
+          gcloud auth configure-docker europe-west1-docker.pkg.dev --quiet
+          IMAGE="${REGISTRY}/${SERVICE}:${{ github.event.release.tag_name }}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "Built and stored: $IMAGE — nothing was deployed."

@@ -4,7 +4,7 @@ go 1.24.9
 
 require (
 	github.com/ethereum/go-ethereum v1.17.0
-	github.com/evmi-cloud/go-evm-indexer v0.0.0-20260823092941-08adb0f65061
+	github.com/evmi-cloud/go-evm-indexer v0.0.0-20260830230648-b3e187c9c01f
 	github.com/lib/pq v1.10.9
 	github.com/lmittmann/w3 v0.20.7
 )

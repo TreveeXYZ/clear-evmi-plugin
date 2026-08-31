@@ -36,7 +36,24 @@ go get -u github.com/evmi-cloud/go-evm-indexer && go mod tidy
 
 Dependencies are `lib/pq`, the EVMI SDK, and [`lmittmann/w3`](https://github.com/lmittmann/w3)
 (chain access — RPC client, ABI bindings; it pulls in go-ethereum). Note `go get -u` will raise the
-`go` directive past `1.24.9`, so bump deliberately and pin.
+`go` directive, so bump deliberately and keep the Dockerfile's `GO_IMAGE` in step with it.
+
+Pub/Sub notifications are NOT this plugin's job: the generic `gcp-pubsub` exporter plugin
+(github.com/evmi-cloud/go-evm-indexer-plugins, backed up at TreveeXYZ/go-evm-indexer-plugins) runs
+as a second exporter on the same pipeline and publishes every log with filterable attributes
+(`eventName`, `contractName`, `address`, `chainId`). This plugin stays a pure materializer. Note
+the two exporters advance independent cursors: a Pub/Sub message can precede this plugin's
+materialization of the same event — consumers must not read `clear_*` expecting the event that
+woke them to already be there.
+
+`.github/workflows/` follows the org-wide chain: `ci.yml` (vet + build + full test suite against a
+Postgres service container, on every PR), `build.yml` (builds and stores the release image on a
+GitHub release — deploys nothing) and `deploy.yml` (human-triggered rollout/rollback of a chosen
+version). The `Dockerfile` builds the **production EVMI image**: the indexer server compiled from
+our pinned fork (`TreveeXYZ/go-evm-indexer`, same commit the SDK is pinned to) plus this plugin's
+source baked in as a local git repo with warmed module/build caches — EVMI's only plugin source is
+`git clone` + `go build` at startup, so the first boot performs that one build fully offline
+(`gitUrl: "file:///opt/clear-evmi-plugin"`). Config is mounted at runtime via `CONFIG_FILE_PATH`.
 
 `autoload.config.json` wires the entire EVMI deployment declaratively (ABIs, blockchain, log store, pipeline, sources, plugin, exporter). Its `plugins` entry is `{name, description, gitUrl, gitRef}` — git is the only supported source and the build target is always the repo root, so there is no package path to configure. See README for the placeholders to replace before use.
 

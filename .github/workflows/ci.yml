@@ -1,0 +1,44 @@
+# Runs on every PR (and pushes to main): vet, build, and the full test suite —
+# including the protocol replay integration test against a real Postgres, which
+# is why there is a service container. No deploy, no cloud credentials.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: evmi
+          POSTGRES_PASSWORD: evmi
+          POSTGRES_DB: evmi
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go vet ./...
+
+      - run: go build ./...
+
+      - name: Tests (unit + integration)
+        env:
+          CLEAR_DEFI_POSTGRES_DSN: postgres://evmi:evmi@localhost:5432/evmi?sslmode=disable
+        run: go test ./...

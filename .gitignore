@@ -1,3 +1,5 @@
 # built plugin binary (EVMI builds it itself from git; see PLUGIN.md)
 /clear-defi
 /clear-defi.exe
+/clear-evmi-plugin
+/clear-evmi-plugin.exe

@@ -20,8 +20,8 @@
   {
    "name": "gcp-pubsub",
    "description": "Publishes indexed logs to Pub/Sub",
-   "gitUrl": "https://github.com/TreveeXYZ/go-evm-indexer-plugins.git",
-   "gitRef": "v0.1.0",
+   "gitUrl": "file:///opt/go-evm-indexer-plugins",
+   "gitRef": "",
    "path": "plugins/gcp-pubsub"
   }
  ],

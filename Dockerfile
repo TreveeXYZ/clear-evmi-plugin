@@ -41,6 +41,23 @@ RUN cd /opt/clear-evmi-plugin \
  && go mod download \
  && go build -o /dev/null .
 
+# The gcp-pubsub exporter plugin gets the SAME treatment as this plugin:
+# source baked as a local single-commit repo, module and build caches warmed.
+# Without this it is cloned from GitHub and compiled cold at every instance
+# start (~5-10 min on 1 vCPU, network required) — the boot must stay offline
+# and fast for BOTH plugins.
+ARG PLUGINS_REPO=https://github.com/TreveeXYZ/go-evm-indexer-plugins.git
+ARG PLUGINS_REF=v0.1.0
+RUN git clone --quiet --depth 1 --branch ${PLUGINS_REF} ${PLUGINS_REPO} /opt/go-evm-indexer-plugins \
+ && cd /opt/go-evm-indexer-plugins \
+ && rm -rf .git \
+ && git init --quiet --initial-branch=main \
+ && git add --all \
+ && git -c user.email=build@clear.invalid -c user.name=build commit --quiet -m "baked at image build" \
+ && cd plugins/gcp-pubsub \
+ && go mod download \
+ && go build -o /dev/null .
+
 # envsubst (gettext-base) is the whole rendering machinery.
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends gettext-base \
  && rm -rf /var/lib/apt/lists/*

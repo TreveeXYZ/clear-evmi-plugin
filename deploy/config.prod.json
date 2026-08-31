@@ -117,8 +117,8 @@
     "abi": "CurveStableSwapFactoryNG",
     "type": "CONTRACT",
     "enabled": true,
-    "startBlock": 11515300,
-    "address": "0xa18Eb0d4cd7F45BCB0AD2b751Fa54828057c899A"
+    "startBlock": 11604300,
+    "address": "0x4681A8f3A6b087984159cc457609FfCC418Ed294"
    },
    {
     "pipeline": "clear-rfq",
@@ -126,8 +126,8 @@
     "abi": "ClearReserveFactory",
     "type": "FACTORY",
     "enabled": true,
-    "startBlock": 11515300,
-    "address": "0x6fb294549536dd918e81dFd4C5286ea3323dD557",
+    "startBlock": 11604300,
+    "address": "0xC1DDfA975835588fb185896C3c82D324D0Dc47B9",
     "factoryRules": [
      {
       "creationFunctionName": "NewClearReserve",
@@ -179,8 +179,8 @@
     "abi": "ClearAccessManager",
     "type": "CONTRACT",
     "enabled": true,
-    "startBlock": 11515300,
-    "address": "0x32B133c3903a3FA537bc5a264e4A9D7cD30982CE"
+    "startBlock": 11604300,
+    "address": "0xad3493A766AE01d3F4D4F2762fECC14861E260ca"
    },
    {
     "pipeline": "clear-rfq",
@@ -188,16 +188,17 @@
     "abi": "ClearOracle",
     "type": "CONTRACT",
     "enabled": true,
-    "startBlock": 11515300,
-    "address": "0x616c38584a7A51065770a1E161EAAdbC5DF8B542"
+    "startBlock": 11604300,
+    "address": "0xFee81ad61ba8f4712e70dE328A01bf41D61ad40d"
    },
    {
     "pipeline": "clear-rfq",
     "abi": "PythOracleAdapter",
     "type": "CONTRACT",
-    "enabled": true,
-    "startBlock": 11515300,
-    "address": "0xa1eb32bb9b2afedf5de0fe03b63b8ea7e5d64c59"
+    "enabled": false,
+    "startBlock": 11604300,
+    "address": "0xa1eb32bb9b2afedf5de0fe03b63b8ea7e5d64c59",
+    "_comment": "Redeployed 2026-08-31; new adapter address unknown \u2014 re-enable with it"
    }
   ],
   "exporters": [
@@ -206,7 +207,7 @@
     "pipeline": "clear-rfq",
     "plugin": "Clear",
     "enabled": true,
-    "startBlock": 11515300,
+    "startBlock": 11604300,
     "pluginConfig": {
      "dsn": "${CLEAR_DB_DSN}",
      "autoMigrate": true
@@ -217,7 +218,7 @@
     "pipeline": "clear-rfq",
     "plugin": "gcp-pubsub",
     "enabled": true,
-    "startBlock": 11515300,
+    "startBlock": 11604300,
     "pluginConfig": {
      "projectId": "clear-prod",
      "topicId": "clear-protocol-events"

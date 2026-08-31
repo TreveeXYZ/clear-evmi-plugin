@@ -9,8 +9,11 @@
 # branch), pre-fills the module and build caches, and lets the first boot do
 # the one native build (~seconds, fully offline — no GitHub, no module proxy).
 #
-# Config is NOT baked. Mount the autoload JSON (DSN, RPC, contracts, topic) and
-# point CONFIG_FILE_PATH at it (Cloud Run: a Secret Manager volume).
+# Config IS baked — as a template. deploy/config.prod.json is the committed,
+# reviewable config with exactly three secret slots (${EVMI_DB_DSN},
+# ${CLEAR_DB_DSN}, ${RPC_URL}); the entrypoint renders it at boot from
+# environment variables (Cloud Run secret_env <- Secret Manager) and starts
+# the server. Changing anything else in the config is a PR + release.
 ARG GO_IMAGE=golang:1.25-bookworm
 
 FROM ${GO_IMAGE} AS server
@@ -38,5 +41,11 @@ RUN cd /opt/clear-evmi-plugin \
  && go mod download \
  && go build -o /dev/null .
 
-ENV CONFIG_FILE_PATH=/etc/evmi/config.json
-ENTRYPOINT ["evm-indexer", "start"]
+# envsubst (gettext-base) is the whole rendering machinery.
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends gettext-base \
+ && rm -rf /var/lib/apt/lists/*
+COPY deploy/config.prod.json /opt/evmi/config.prod.json
+COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["entrypoint.sh"]

@@ -195,10 +195,10 @@
     "pipeline": "clear-rfq",
     "abi": "PythOracleAdapter",
     "type": "CONTRACT",
-    "enabled": false,
+    "enabled": true,
     "startBlock": 11604300,
-    "address": "0xa1eb32bb9b2afedf5de0fe03b63b8ea7e5d64c59",
-    "_comment": "Redeployed 2026-08-31; new adapter address unknown \u2014 re-enable with it"
+    "address": "0xb2ab32e7838803fbf2ddc615d89c8979004a2645",
+    "_comment": "PythOracleAdapter of the 2026-08-31 redeploy; PriceUpdated feeds clear_oracle_prices"
    }
   ],
   "exporters": [

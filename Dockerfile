@@ -19,8 +19,10 @@ ARG GO_IMAGE=golang:1.25-bookworm
 FROM ${GO_IMAGE} AS server
 # Pinned to the same commit go.mod pins the SDK to (TreveeXYZ/go-evm-indexer is
 # our backup fork of evmi-cloud/go-evm-indexer; sync it before bumping this).
+# 0c9de93 = upstream main with our two merged PRs (bounded SQL pools,
+# gitRef by commit id) and nothing else.
 ARG EVMI_REPO=https://github.com/TreveeXYZ/go-evm-indexer.git
-ARG EVMI_REF=b3e187c9c01fa2057acd4480380d369c998de7fb
+ARG EVMI_REF=0c9de934023bfacd9a90fdc50b69bb8dce3181b3
 RUN git clone --filter=blob:none ${EVMI_REPO} /src \
  && cd /src && git checkout --quiet ${EVMI_REF} \
  && go build -o /evm-indexer ./cmd/evm-indexer
@@ -46,10 +48,13 @@ RUN cd /opt/clear-evmi-plugin \
 # Without this it is cloned from GitHub and compiled cold at every instance
 # start (~5-10 min on 1 vCPU, network required) — the boot must stay offline
 # and fast for BOTH plugins.
+# Pinned by commit id, not by tag: a tag can be moved, a commit cannot.
+# 4ea454e = the commit our v0.1.0 tag pointed at; upstream is unchanged since.
 ARG PLUGINS_REPO=https://github.com/TreveeXYZ/go-evm-indexer-plugins.git
-ARG PLUGINS_REF=v0.1.0
-RUN git clone --quiet --depth 1 --branch ${PLUGINS_REF} ${PLUGINS_REPO} /opt/go-evm-indexer-plugins \
+ARG PLUGINS_REF=4ea454e24212511d7c6d165252972e262310067c
+RUN git clone --quiet --filter=blob:none ${PLUGINS_REPO} /opt/go-evm-indexer-plugins \
  && cd /opt/go-evm-indexer-plugins \
+ && git checkout --quiet ${PLUGINS_REF} \
  && rm -rf .git \
  && git init --quiet --initial-branch=main \
  && git add --all \

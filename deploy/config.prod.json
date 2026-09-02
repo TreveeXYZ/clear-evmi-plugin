@@ -117,8 +117,8 @@
     "abi": "CurveStableSwapFactoryNG",
     "type": "CONTRACT",
     "enabled": true,
-    "startBlock": 11604300,
-    "address": "0x4681A8f3A6b087984159cc457609FfCC418Ed294"
+    "startBlock": 11608991,
+    "address": "0x21b024fbef8462ece48c8d4c9b22cf172c0dfade"
    },
    {
     "pipeline": "clear-rfq",
@@ -126,8 +126,8 @@
     "abi": "ClearReserveFactory",
     "type": "FACTORY",
     "enabled": true,
-    "startBlock": 11604300,
-    "address": "0xC1DDfA975835588fb185896C3c82D324D0Dc47B9",
+    "startBlock": 11608991,
+    "address": "0x7dc44cf45203e649da22083b070b4319e1a014e4",
     "factoryRules": [
      {
       "creationFunctionName": "NewClearReserve",
@@ -179,8 +179,8 @@
     "abi": "ClearAccessManager",
     "type": "CONTRACT",
     "enabled": true,
-    "startBlock": 11604300,
-    "address": "0xad3493A766AE01d3F4D4F2762fECC14861E260ca"
+    "startBlock": 11608991,
+    "address": "0xb702d762f804e7bc1144eebb64bcc4bb6b99f78c"
    },
    {
     "pipeline": "clear-rfq",
@@ -188,17 +188,17 @@
     "abi": "ClearOracle",
     "type": "CONTRACT",
     "enabled": true,
-    "startBlock": 11604300,
-    "address": "0xFee81ad61ba8f4712e70dE328A01bf41D61ad40d"
+    "startBlock": 11608991,
+    "address": "0x06a88ada0d738947745ea7afc8da32df9cf7da4f"
    },
    {
     "pipeline": "clear-rfq",
     "abi": "PythOracleAdapter",
     "type": "CONTRACT",
     "enabled": true,
-    "startBlock": 11604300,
-    "address": "0xb2ab32e7838803fbf2ddc615d89c8979004a2645",
-    "_comment": "PythOracleAdapter of the 2026-08-31 redeploy; PriceUpdated feeds clear_oracle_prices"
+    "startBlock": 11608991,
+    "address": "0x252566d96401a34255fbd421d08a1efd167b0b31",
+    "_comment": "PythOracleAdapter of the 2026-08-31 23:47 UTC redeploy (a07db3a)"
    }
   ],
   "exporters": [

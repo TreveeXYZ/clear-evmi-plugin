@@ -37,7 +37,7 @@
     "rpcUrl": "${RPC_URL}",
     "blockRange": 500,
     "blockSlice": 5,
-    "pullInterval": 5,
+    "pullInterval": 12,
     "rpcMaxBatchSize": 1000,
     "sqdGatewayAvailable": false,
     "sqdGatewayUrl": ""

@@ -22,7 +22,7 @@ FROM ${GO_IMAGE} AS server
 # 0c9de93 = upstream main with our two merged PRs (bounded SQL pools,
 # gitRef by commit id) and nothing else.
 ARG EVMI_REPO=https://github.com/TreveeXYZ/go-evm-indexer.git
-ARG EVMI_REF=0c9de934023bfacd9a90fdc50b69bb8dce3181b3
+ARG EVMI_REF=bb7b39a9c49ec3cb209239aaed06ee4507e2d890
 RUN git clone --filter=blob:none ${EVMI_REPO} /src \
  && cd /src && git checkout --quiet ${EVMI_REF} \
  && go build -o /evm-indexer ./cmd/evm-indexer

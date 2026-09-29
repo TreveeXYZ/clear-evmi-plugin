@@ -19,10 +19,11 @@ ARG GO_IMAGE=golang:1.25-bookworm
 FROM ${GO_IMAGE} AS server
 # Pinned to the same commit go.mod pins the SDK to (TreveeXYZ/go-evm-indexer is
 # our backup fork of evmi-cloud/go-evm-indexer; sync it before bumping this).
-# 0c9de93 = upstream main with our two merged PRs (bounded SQL pools,
-# gitRef by commit id) and nothing else.
+# f00799f = bb7b39a (shared chain-head poll, upstream PR #7) plus the
+# store-closing fix (upstream PR #8): a stopped exporter or source releases
+# its pool, and the exporter starts its plugin before connecting its store.
 ARG EVMI_REPO=https://github.com/TreveeXYZ/go-evm-indexer.git
-ARG EVMI_REF=bb7b39a9c49ec3cb209239aaed06ee4507e2d890
+ARG EVMI_REF=f00799f33f069864beab7853c9946d69bea3d643
 RUN git clone --filter=blob:none ${EVMI_REPO} /src \
  && cd /src && git checkout --quiet ${EVMI_REF} \
  && go build -o /evm-indexer ./cmd/evm-indexer

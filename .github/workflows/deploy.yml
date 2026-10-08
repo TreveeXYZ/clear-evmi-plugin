@@ -29,6 +29,9 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Only main may run this job (environment policy), and only a job in this
+    # environment gets GCP credentials: a workflow edited on a branch gets nothing.
+    environment: production
     steps:
       - uses: google-github-actions/auth@v2
         with:

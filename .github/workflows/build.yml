@@ -24,8 +24,20 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # The `production` environment admits only main and v* tags; GCP trusts
+    # tokens minted inside it and nowhere else.
+    environment: production
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The whole history: the release commit must be reachable from main.
+          fetch-depth: 0
+
+      - name: Refuse a release that is not on main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::${GITHUB_REF_NAME} is not on main, no image is built"; exit 1; }
 
       - uses: google-github-actions/auth@v2
         with:

@@ -68,11 +68,11 @@ func (e *clearExporter) dispatchReserve(tx *sql.Tx, log exporter.LogEvent, k con
 		return e.trackContract(tx, log.ChainId, iou, iouKind, log.BlockNumber)
 	case "FlashLoan":
 		return handleFlashLoan(tx, log, k)
+	case "DonationRecognized":
+		return handleDonationRecognized(tx, log, k)
 
 	// --- governance settings (every set* function emits one of these) ---
 	// Each folds its own column(s) into the reserve's clear_reserve_settings row.
-	case "ConfigUpdated":
-		return handleReserveSettings(tx, log, k, "config_address", normAddr(log.Args["config"]))
 	case "FlashFeeUpdated":
 		return handleReserveSettings(tx, log, k, "flash_fee_bps", num(log.Args, "flashFeeBps"))
 	case "BaseQuoteFeeBpsUpdated":
@@ -83,8 +83,8 @@ func (e *clearExporter) dispatchReserve(tx *sql.Tx, log exporter.LogEvent, k con
 		return handleReserveSettings(tx, log, k, "redemption_proximity_bps", num(log.Args, "redemptionProximityBps"))
 	case "RebalanceTriggerBpsUpdated":
 		return handleReserveSettings(tx, log, k, "rebalance_trigger_bps", num(log.Args, "triggerBps"))
-	case "DepositWeightToleranceBpsUpdated":
-		return handleReserveSettings(tx, log, k, "deposit_weight_tolerance_bps", num(log.Args, "toleranceBps"))
+	case "RebalanceDeviationBpsUpdated":
+		return handleReserveSettings(tx, log, k, "rebalance_deviation_bps", num(log.Args, "deviationBps"))
 	case "IouDistributionUpdated":
 		return handleReserveSettings(tx, log, k,
 			"iou_trader_bps", num(log.Args, "traderBps"),
@@ -136,7 +136,9 @@ func dispatchCurve(tx *sql.Tx, log exporter.LogEvent) error {
 }
 
 // dispatchOracle handles ClearOracle and PythOracleAdapter events (both classify
-// as oracleKind and fold into clear_oracle_prices by asset).
+// as oracleKind and fold into clear_oracle_prices by asset). The adapter's global
+// MaxConfidenceBpsUpdated / PythUpdated and the oracle's sequencer switch are not
+// per-asset and are ignored.
 func dispatchOracle(tx *sql.Tx, log exporter.LogEvent) error {
 	switch log.EventName {
 	case "OracleConfigured":
@@ -145,8 +147,12 @@ func dispatchOracle(tx *sql.Tx, log exporter.LogEvent) error {
 		return handleOracleRate(tx, log)
 	case "ClearOracleRedemptionPriceChanged":
 		return handleOracleRedemption(tx, log)
+	case "ClearOraclePriceInvalidated":
+		return handleOracleInvalidated(tx, log)
 	case "PriceUpdated":
 		return handleOraclePublish(tx, log)
+	case "AssetMaxConfidenceBpsUpdated":
+		return handleOracleMaxConfidence(tx, log)
 	}
 	return nil
 }
@@ -168,16 +174,31 @@ func (e *clearExporter) dispatchFactory(tx *sql.Tx, log exporter.LogEvent) error
 		return handleFactoryImplementation(tx, log, "meta_reserve_implementation", "meta_reserve_version")
 	case "NewIOUImplementation":
 		return handleFactoryImplementation(tx, log, "iou_implementation", "iou_version")
+	case "CurvePoolDeployerUpdated":
+		return handleFactoryConfig(tx, log, "curve_pool_deployer", normAddr(log.Args["deployer"]))
 	}
 	return nil
 }
 
 // dispatchCurveDeployer handles ClearCurvePoolDeployer events. PoolDeployed names
 // every Curve pool deployed for a reserve, so pools are registered (and linked
-// back to their reserve / base pool / paired coin) from their creation log.
+// back to their reserve / base pool / paired coin) from their creation log. The
+// deployer's own configuration (target Curve factory, pool parameters) folds into
+// clear_curve_deployer_config.
 func (e *clearExporter) dispatchCurveDeployer(tx *sql.Tx, log exporter.LogEvent) error {
-	if log.EventName == "PoolDeployed" {
+	switch log.EventName {
+	case "PoolDeployed":
 		return e.handlePoolDeployed(tx, log)
+	case "FactoryUpdated":
+		return handleCurveDeployerConfig(tx, log, "curve_factory", normAddr(log.Args["factory"]))
+	case "PoolParamsUpdated":
+		a := log.Args
+		return handleCurveDeployerConfig(tx, log,
+			"amplification", num(a, "amplification"),
+			"fee", num(a, "fee"),
+			"offpeg_fee_multiplier", num(a, "offpegFeeMultiplier"),
+			"ma_exp_time", num(a, "maExpTime"),
+			"implementation_idx", num(a, "implementationIdx"))
 	}
 	return nil
 }

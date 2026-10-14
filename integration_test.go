@@ -436,6 +436,27 @@ func TestReplayProtocol(t *testing.T) {
 		mkLog(114, 0, IOU, metaIou1, "Transfer", map[string]string{"from": zeroAddr, "to": bob, "value": "10"}),
 		mkLog(114, 1, META, metaReserve, "IOUMinted", map[string]string{
 			"caller": bob, "asset": nativeTok, "receiver": bob, "amount": "10"}),
+
+		// The native leg's redemption price moves off par (0.99). The meta reserve
+		// values its legs and its IOU debt on the redemption basis, so its next
+		// snapshot — the DonationRecognized right after — reflects it.
+		mkLog(115, 0, ORACLE, oracleAddr, "OracleConfigured", map[string]string{
+			"enabled": "true", "asset": nativeTok, "assetDecimals": "6", "oracleDecimals": "8",
+			"priceTTL": "3600", "redemptionPrice": "99000000"}),
+		// Governance folds a 1-unit direct transfer into the native leg's accounted
+		// balance: the one inflow that does not go through an entry point.
+		mkLog(115, 1, META, metaReserve, "DonationRecognized", map[string]string{"leg": nativeTok, "units": "1"}),
+		// Oracle governance: drop the native leg's cached price, and cap its Pyth
+		// confidence interval on the adapter.
+		mkLog(115, 2, ORACLE, oracleAddr, "ClearOraclePriceInvalidated", map[string]string{"asset": nativeTok}),
+		mkLog(115, 3, ADAPTER, adapterAddr, "AssetMaxConfidenceBpsUpdated", map[string]string{"asset": nativeTok, "maxConfidenceBps": "50"}),
+		// Settings and config the audited contracts added.
+		mkLog(115, 4, META, metaReserve, "RebalanceDeviationBpsUpdated", map[string]string{"deviationBps": "500"}),
+		mkLog(115, 5, FACTORY, factory, "CurvePoolDeployerUpdated", map[string]string{"deployer": deployer}),
+		mkLog(115, 6, DEPLOYER, deployer, "FactoryUpdated", map[string]string{"factory": curveFactoryAddr}),
+		mkLog(115, 7, DEPLOYER, deployer, "PoolParamsUpdated", map[string]string{
+			"amplification": "200", "fee": "1000000", "offpegFeeMultiplier": "20000000000",
+			"maExpTime": "866", "implementationIdx": "0"}),
 	}
 
 	for _, l := range logs {
@@ -483,27 +504,31 @@ func TestReplayProtocol(t *testing.T) {
 
 	// --- meta reserve: legs, physical balances, and NAV-priced value ---
 	// native leg = nativeTok (6-dec), BaseLP leg = the base reserve itself.
-	//   native  = 200(deposit) + 50 - 1(single-asset fee) + 10(iou mint) = 259
+	//   native  = 200(deposit) + 50 - 1(single-asset fee) + 10(iou mint) + 1(donation) = 260
 	//   base LP = 800(deposit)
 	eq(t, db, "meta native leg holdings", `SELECT count(*) FROM clear_reserve_token_balances
-		WHERE reserve=$1 AND asset=$2 AND balance=259`, metaReserve, nativeTok)
+		WHERE reserve=$1 AND asset=$2 AND balance=260`, metaReserve, nativeTok)
 	eq(t, db, "meta baseLP leg holdings", `SELECT count(*) FROM clear_reserve_token_balances
 		WHERE reserve=$1 AND asset=$2 AND balance=800`, metaReserve, reserve)
-	// The BaseLP leg is NOT valued at par: it is converted at the base reserve's
-	// NAV/share, with the contract's +1/+1 virtual offset and integer truncation
-	// (ClearMetaReserve.baseLpValue -> ClearBaseReserve.convertToValue). The base
-	// figures below are the ones asserted above, so this does not consult the view.
-	//   gross = 259 * 10^12  +  trunc(800 * (2855e12 + 1) / (1450 + 1))
-	//   debt  = the native IOU's 10 at par; the BaseLP leg's IOU is untouched
+	// Both legs are valued on the REDEMPTION basis (ClearMetaReserve._legValueOf):
+	//   native: units * 10^12 * redemption(0.99e18) / 1e18
+	//   BaseLP: the base reserve's NAV/share with the contract's +1/+1 virtual offset
+	//           and integer truncation (convertToValue), times the base reserve's
+	//           net-weighted average redemption price — par here (usdc is configured
+	//           at 1e8, usdt is not in the oracle table and falls back to par).
+	// The base figures below are the ones asserted above, so this does not consult
+	// the view. The last meta event (DonationRecognized, block 115) holds the day's row.
+	//   gross = trunc(260e12 * 0.99)  +  trunc(800 * (2855e12 + 1) / (1450 + 1))
+	//   debt  = the native IOU's 10 at 0.99; the BaseLP leg's IOU is untouched
 	eq(t, db, "meta daily value", `SELECT count(*) FROM clear_reserve_value_history
-		WHERE reserve=$1 AND block_number=114 AND total_supply=1048
-		AND total_assets = 259 * 1000000000000 + trunc(800 * (2855000000000000 + 1) / (1450 + 1))
-		AND iou_debt = 10 * 1000000000000
+		WHERE reserve=$1 AND block_number=115 AND total_supply=1048
+		AND total_assets = 257400000000000 + trunc(800 * (2855000000000000 + 1) / (1450 + 1))
+		AND iou_debt = 9900000000000
 		AND nav = total_assets - iou_debt`, metaReserve)
 	// Par-valuing the BaseLP leg would have given 800 flat instead of ~1.5e15, so
 	// the row must be far above the par figure.
 	if n := count(t, db, `SELECT count(*) FROM clear_reserve_value_history
-		WHERE reserve=$1 AND total_assets > 259 * 1000000000000 + 1000000000`, metaReserve); n != 1 {
+		WHERE reserve=$1 AND total_assets > 257400000000000 + 1000000000`, metaReserve); n != 1 {
 		t.Error("meta total_assets looks par-valued: the BaseLP leg was not converted at the base reserve's NAV")
 	}
 
@@ -525,12 +550,12 @@ func TestReplayProtocol(t *testing.T) {
 	}
 	// activity, base reserve: deposit x2, iou_minted x1, withdraw x1,
 	// single_deposit x1, rebalance x1 (Swap is NOT activity); meta reserve adds
-	// deposit x1, single_deposit x1, iou_minted x1.
+	// deposit x1, single_deposit x1, iou_minted x1, donation x1.
 	if got := count(t, db, `SELECT count(*) FROM clear_reserve_activity WHERE reserve=$1`, reserve); got != 6 {
 		t.Errorf("base reserve activity rows = %d, want 6", got)
 	}
-	if got := count(t, db, `SELECT count(*) FROM clear_reserve_activity WHERE reserve=$1`, metaReserve); got != 3 {
-		t.Errorf("meta reserve activity rows = %d, want 3", got)
+	if got := count(t, db, `SELECT count(*) FROM clear_reserve_activity WHERE reserve=$1`, metaReserve); got != 4 {
+		t.Errorf("meta reserve activity rows = %d, want 4", got)
 	}
 	eq(t, db, "withdraw activity", `SELECT count(*) FROM clear_reserve_activity WHERE action='withdraw' AND caller=$1 AND lp=100`, alice)
 
@@ -575,14 +600,29 @@ func TestReplayProtocol(t *testing.T) {
 		 AND swap_spread_min_bps=3 AND swap_spread_max_bps=500
 		 AND iou_trader_bps=2000 AND iou_treasury_bps=4000
 		 AND rebalance_trigger_bps=7000 AND flash_fee_bps IS NULL`, reserve)
+	eq(t, db, "meta reserve settings", `SELECT count(*) FROM clear_reserve_settings
+		 WHERE reserve=$1 AND kind='meta' AND rebalance_deviation_bps=500`, metaReserve)
+
+	// --- curve pool deployer config ---
+	eq(t, db, "curve deployer config", `SELECT count(*) FROM clear_curve_deployer_config
+		 WHERE deployer=$1 AND curve_factory=$2 AND amplification=200 AND fee=1000000
+		 AND offpeg_fee_multiplier=20000000000 AND ma_exp_time=866 AND implementation_idx=0`,
+		deployer, curveFactoryAddr)
+
+	// --- oracle governance: invalidation + per-asset confidence cap ---
+	// Invalidation zeroes the price but keeps the config and redemption price.
+	eq(t, db, "native price invalidated", `SELECT count(*) FROM clear_oracle_prices
+		 WHERE asset=$1 AND price=0 AND publish_time IS NULL AND redemption_price=99000000
+		 AND max_confidence_bps=50 AND oracle=$2`, nativeTok, oracleAddr)
 
 	// --- IOU treasury fee (only ClearIOUMinted carries the split) ---
 	eq(t, db, "iou treasury fee", `SELECT count(*) FROM clear_iou_tokens WHERE address=$1 AND total_supply=5 AND treasury_fees=1`, iou1)
 
 	// --- factory: protocol config + reserve discovery ---
 	eq(t, db, "protocol config", `SELECT count(*) FROM clear_protocol_config
-		 WHERE factory=$1 AND treasury=$2 AND meta_reserve_implementation=$3 AND meta_reserve_version=2`,
-		factory, treasuryAddr, implAddr)
+		 WHERE factory=$1 AND treasury=$2 AND meta_reserve_implementation=$3 AND meta_reserve_version=2
+		 AND curve_pool_deployer=$4`,
+		factory, treasuryAddr, implAddr, deployer)
 	eq(t, db, "meta reserve row", `SELECT count(*) FROM clear_reserves
 		 WHERE address=$1 AND kind='meta' AND name='Clear Meta USD' AND symbol='cmUSD'
 		 AND reserve_index=1 AND implementation=$2 AND factory=$3

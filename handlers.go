@@ -361,7 +361,7 @@ func insertActivity(tx *sql.Tx, log exporter.LogEvent, reserve, action, caller, 
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 ON CONFLICT (id) DO NOTHING`,
 		log.Id, log.ChainId, reserve, log.BlockNumber, log.LogIndex, log.TransactionHash, action,
-		caller, receiver, nullEmpty(asset), amount, amount2, fee, lp)
+		nullEmpty(caller), nullEmpty(receiver), nullEmpty(asset), amount, amount2, fee, lp)
 }
 
 func nullEmpty(s string) sql.NullString {
@@ -508,6 +508,27 @@ func handleFlashLoan(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 	return insertActivity(tx, log, reserve, "flash_loan",
 		normAddr(a["initiator"]), normAddr(a["receiver"]), normAddr(a["token"]),
 		num(a, "amount"), "0", num(a, "fee"), "0")
+}
+
+// handleDonationRecognized books tokens that reached the reserve without an entry
+// point (a plain transfer). The reserve values only its accountedBalance, and
+// recognizeDonation is the one path that folds such a balance into it — so this is
+// the inflow that keeps clear_reserve_token_balances equal to accountedBalance.
+// The base reserve names the token `asset`, the meta reserve `leg`.
+func handleDonationRecognized(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
+	a := log.Args
+	reserve := normAddr(log.Address)
+	asset := normAddr(firstArg(a, "asset", "leg"))
+	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := adjustTokenBalance(tx, log.ChainId, reserve, asset, num(a, "units"), log.BlockNumber); err != nil {
+		return err
+	}
+	if err := snapshotReserveValue(tx, reserve, log); err != nil {
+		return err
+	}
+	return insertActivity(tx, log, reserve, "donation", "", "", asset, num(a, "units"), "0", "0", "0")
 }
 
 func handleIOUMinted(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
@@ -759,6 +780,37 @@ ON CONFLICT (chain_id, asset) DO UPDATE SET
 		log.ChainId, asset, num(a, "redemptionPrice"), log.BlockTimestamp, log.BlockNumber)
 }
 
+// handleOracleInvalidated mirrors invalidatePrice: governance zeroes the cached
+// price and its timestamp so reads revert until a fresh update lands. The row keeps
+// its config and redemption price; price drops to 0 and publish_time to NULL.
+func handleOracleInvalidated(tx *sql.Tx, log exporter.LogEvent) error {
+	asset := normAddr(log.Args["asset"])
+	if asset == "" {
+		return nil
+	}
+	return exec(tx, `INSERT INTO clear_oracle_prices (chain_id, asset, oracle, price, last_refresh, last_block)
+VALUES ($1,$2,$3,0,$4,$5)
+ON CONFLICT (chain_id, asset) DO UPDATE SET
+  oracle = EXCLUDED.oracle, price = 0, publish_time = NULL,
+  last_refresh = EXCLUDED.last_refresh, last_block = EXCLUDED.last_block`,
+		log.ChainId, asset, normAddr(log.Address), log.BlockTimestamp, log.BlockNumber)
+}
+
+// handleOracleMaxConfidence records the adapter's per-asset override of the widest
+// Pyth confidence interval (conf/price, bps) it will relay. Like PriceUpdated it
+// comes from the adapter, so `oracle` is left alone.
+func handleOracleMaxConfidence(tx *sql.Tx, log exporter.LogEvent) error {
+	asset := normAddr(log.Args["asset"])
+	if asset == "" {
+		return nil
+	}
+	return exec(tx, `INSERT INTO clear_oracle_prices (chain_id, asset, max_confidence_bps, last_block)
+VALUES ($1,$2,$3,$4)
+ON CONFLICT (chain_id, asset) DO UPDATE SET
+  max_confidence_bps = EXCLUDED.max_confidence_bps, last_block = EXCLUDED.last_block`,
+		log.ChainId, asset, num(log.Args, "maxConfidenceBps"), log.BlockNumber)
+}
+
 // handleOraclePublish records the adapter's price refresh. It does not overwrite
 // `oracle` — log.Address here is the adapter, not the ClearOracle. `publishTime`
 // is Pyth's own timestamp for the price (when the feed published it, which is
@@ -791,16 +843,25 @@ ON CONFLICT (chain_id, asset) DO UPDATE SET
 // handleReserveSettings upserts the reserve's settings row. colVals is a flat list
 // of column/value pairs (column names are code constants, never event data).
 func handleReserveSettings(tx *sql.Tx, log exporter.LogEvent, k contractKind, colVals ...string) error {
-	if len(colVals) == 0 || len(colVals)%2 != 0 {
-		return fmt.Errorf("reserve settings %s: malformed column/value list", log.EventName)
-	}
 	reserve := normAddr(log.Address)
 	if err := ensureReserve(tx, log.ChainId, reserve, k.reserveType(), log.BlockNumber); err != nil {
 		return err
 	}
+	return upsertPatch(tx, log, "clear_reserve_settings",
+		[]string{"chain_id", "reserve", "kind"}, []any{log.ChainId, reserve, k.reserveType()}, colVals...)
+}
 
-	cols := []string{"chain_id", "reserve", "kind"}
-	args := []any{log.ChainId, reserve, k.reserveType()}
+// upsertPatch inserts or patches one row of a "fold the setters" table: keyCols/
+// keyArgs identify the row (the first two keys form the conflict target, any further
+// ones are written on insert only), colVals is a flat column/value list. Only the
+// event's own columns and last_block are refreshed on conflict, so the row can be
+// created or updated in any order. Column names are code constants, never event data.
+func upsertPatch(tx *sql.Tx, log exporter.LogEvent, table string, keyCols []string, keyArgs []any, colVals ...string) error {
+	if len(colVals) == 0 || len(colVals)%2 != 0 {
+		return fmt.Errorf("%s %s: malformed column/value list", table, log.EventName)
+	}
+	cols := append([]string{}, keyCols...)
+	args := append([]any{}, keyArgs...)
 	for i := 0; i < len(colVals); i += 2 {
 		cols = append(cols, colVals[i])
 		args = append(args, colVals[i+1])
@@ -812,15 +873,14 @@ func handleReserveSettings(tx *sql.Tx, log exporter.LogEvent, k contractKind, co
 	for i := range cols {
 		ph[i] = fmt.Sprintf("$%d", i+1)
 	}
-	// Only the event's own columns (and last_block) are refreshed on conflict; the
-	// key columns and every other setting keep their stored value.
-	sets := make([]string, 0, len(cols)-3)
-	for _, c := range cols[3:] {
+	sets := make([]string, 0, len(cols)-len(keyCols))
+	for _, c := range cols[len(keyCols):] {
 		sets = append(sets, c+" = EXCLUDED."+c)
 	}
-	return exec(tx, fmt.Sprintf(`INSERT INTO clear_reserve_settings (%s) VALUES (%s)
-ON CONFLICT (chain_id, reserve) DO UPDATE SET %s`,
-		strings.Join(cols, ", "), strings.Join(ph, ", "), strings.Join(sets, ", ")), args...)
+	return exec(tx, fmt.Sprintf(`INSERT INTO %s (%s) VALUES (%s)
+ON CONFLICT (%s) DO UPDATE SET %s`,
+		table, strings.Join(cols, ", "), strings.Join(ph, ", "),
+		strings.Join(keyCols[:2], ", "), strings.Join(sets, ", ")), args...)
 }
 
 // --- IOU treasury fees ---
@@ -908,7 +968,7 @@ WHERE chain_id = $1 AND address = $2`,
 }
 
 // handleFactoryConfig patches one column of the factory's protocol-config row
-// (the factory IS the IClearReserveConfig every reserve points at).
+// (the factory IS the IClearFactory every reserve points at).
 func handleFactoryConfig(tx *sql.Tx, log exporter.LogEvent, col, value string) error {
 	if value == "" {
 		return nil
@@ -935,6 +995,13 @@ ON CONFLICT (chain_id, factory) DO UPDATE SET
 }
 
 // --- curve pool deployer (ClearCurvePoolDeployer) ---
+
+// handleCurveDeployerConfig folds the ClearCurvePoolDeployer's setters
+// (FactoryUpdated, PoolParamsUpdated) into its clear_curve_deployer_config row.
+func handleCurveDeployerConfig(tx *sql.Tx, log exporter.LogEvent, colVals ...string) error {
+	return upsertPatch(tx, log, "clear_curve_deployer_config",
+		[]string{"chain_id", "deployer"}, []any{log.ChainId, normAddr(log.Address)}, colVals...)
+}
 
 // handlePoolDeployed records a Curve pool at its creation, links it back to the
 // reserve it was deployed for, and registers it as a tracked curve pool so its own

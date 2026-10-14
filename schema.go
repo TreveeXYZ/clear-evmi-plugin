@@ -99,25 +99,24 @@ ALTER TABLE clear_reserves ADD COLUMN IF NOT EXISTS tokens JSONB;
 ALTER TABLE clear_reserves ADD COLUMN IF NOT EXISTS factory TEXT;
 
 -- Reserve governance parameters, one row per reserve, folded from the set* events
--- (ConfigUpdated, FlashFeeUpdated, BaseQuoteFeeBpsUpdated, SingleAssetFeeBpsUpdated,
+-- (FlashFeeUpdated, BaseQuoteFeeBpsUpdated, SingleAssetFeeBpsUpdated,
 -- RedemptionProximityBpsUpdated, RebalanceTriggerBpsUpdated,
--- DepositWeightToleranceBpsUpdated, IouDistributionUpdated,
+-- RebalanceDeviationBpsUpdated, IouDistributionUpdated,
 -- BaseQuoteDistributionUpdated, SwapSpreadBpsUpdated). Each event patches only its
 -- own column(s), so a column is NULL until its parameter is first set — the
 -- contract defaults (see RESERVE-SETTINGS.md) are NOT emitted at initialize and so
 -- cannot be observed from events. rebalance_trigger_bps is base-only,
--- deposit_weight_tolerance_bps meta-only.
+-- rebalance_deviation_bps meta-only.
 CREATE TABLE IF NOT EXISTS clear_reserve_settings (
     chain_id                     BIGINT NOT NULL,
     reserve                      TEXT NOT NULL,
     kind                         TEXT NOT NULL,
-    config_address               TEXT,
     flash_fee_bps                NUMERIC,
     base_quote_fee_bps           NUMERIC,
     single_asset_fee_bps         NUMERIC,
     redemption_proximity_bps     NUMERIC,
     rebalance_trigger_bps        NUMERIC,
-    deposit_weight_tolerance_bps NUMERIC,
+    rebalance_deviation_bps      NUMERIC,
     iou_trader_bps               NUMERIC,
     iou_treasury_bps             NUMERIC,
     base_quote_trader_bps        NUMERIC,
@@ -127,11 +126,18 @@ CREATE TABLE IF NOT EXISTS clear_reserve_settings (
     last_block                   BIGINT,
     PRIMARY KEY (chain_id, reserve)
 );
+-- The audited reserves dropped ConfigUpdated (the factory pointer is immutable) and
+-- the meta reserve's DepositWeightToleranceBpsUpdated (balanced deposits now settle
+-- on the current composition); the meta reserve gained a rebalance deviation band.
+ALTER TABLE clear_reserve_settings ADD COLUMN IF NOT EXISTS rebalance_deviation_bps NUMERIC;
+ALTER TABLE clear_reserve_settings DROP COLUMN IF EXISTS config_address;
+ALTER TABLE clear_reserve_settings DROP COLUMN IF EXISTS deposit_weight_tolerance_bps;
 
 -- Protocol-wide config held by the ClearReserveFactory (which IS the
--- IClearReserveConfig every reserve points at): the treasury (NewTreasury) and the
--- current implementation of each clone type with the version the factory bumped it
--- to (New{BaseReserve,MetaReserve,IOU}Implementation). One row per factory.
+-- IClearFactory every reserve points at): the treasury (NewTreasury), the
+-- ClearCurvePoolDeployer it onboards Curve venues through (CurvePoolDeployerUpdated)
+-- and the current implementation of each clone type with the version the factory
+-- bumped it to (New{BaseReserve,MetaReserve,IOU}Implementation). One row per factory.
 CREATE TABLE IF NOT EXISTS clear_protocol_config (
     chain_id                    BIGINT NOT NULL,
     factory                     TEXT NOT NULL,
@@ -142,8 +148,27 @@ CREATE TABLE IF NOT EXISTS clear_protocol_config (
     meta_reserve_version        NUMERIC,
     iou_implementation          TEXT,
     iou_version                 NUMERIC,
+    curve_pool_deployer         TEXT,
     last_block                  BIGINT,
     PRIMARY KEY (chain_id, factory)
+);
+ALTER TABLE clear_protocol_config ADD COLUMN IF NOT EXISTS curve_pool_deployer TEXT;
+
+-- ClearCurvePoolDeployer configuration, one row per deployer: the Curve
+-- StableSwap-NG factory it deploys through (FactoryUpdated) and the parameters it
+-- deploys every pool with (PoolParamsUpdated). Same patch-only-your-columns shape
+-- as clear_reserve_settings; NULL until the setter is first called.
+CREATE TABLE IF NOT EXISTS clear_curve_deployer_config (
+    chain_id              BIGINT NOT NULL,
+    deployer              TEXT NOT NULL,
+    curve_factory         TEXT,
+    amplification         NUMERIC,
+    fee                   NUMERIC,
+    offpeg_fee_multiplier NUMERIC,
+    ma_exp_time           NUMERIC,
+    implementation_idx    NUMERIC,
+    last_block            BIGINT,
+    PRIMARY KEY (chain_id, deployer)
 );
 
 CREATE TABLE IF NOT EXISTS clear_reserve_lp_balances (
@@ -179,12 +204,13 @@ ALTER TABLE clear_reserve_assets ADD COLUMN IF NOT EXISTS position INT;
 ALTER TABLE clear_reserve_assets ADD COLUMN IF NOT EXISTS iou_supply NUMERIC NOT NULL DEFAULT 0;
 ALTER TABLE clear_reserve_assets ADD COLUMN IF NOT EXISTS weight NUMERIC;
 
--- Reserve's physical ERC20 holdings, one row per underlying asset, reconstructed
--- from the token flows in deposit/withdraw/single-asset/rebalance/swap/IOU/flash
--- events (each moves real tokens in or out of the reserve). BASE reserves only;
--- exact only when indexing starts at the reserve's deployment (so no flow and no
--- AssetAdded is missed). This is the true on-chain balanceOf(reserve), unlike the
--- LP/NAV figures in clear_reserves.
+-- Reserve's accounted ERC20 holdings, one row per underlying asset / leg,
+-- reconstructed from the token flows in deposit/withdraw/single-asset/rebalance/
+-- swap/IOU/flash events plus DonationRecognized. This is the contract's
+-- accountedBalance(asset) — what the reserve values itself on — which equals
+-- balanceOf(reserve) minus any direct transfer governance has not yet recognized.
+-- Both reserve types; exact only when indexing starts at the reserve's deployment
+-- (so no flow and no AssetAdded is missed).
 CREATE TABLE IF NOT EXISTS clear_reserve_token_balances (
     chain_id   BIGINT NOT NULL,
     reserve    TEXT NOT NULL,
@@ -284,6 +310,11 @@ CREATE TABLE IF NOT EXISTS clear_oracle_prices (
     PRIMARY KEY (chain_id, asset)
 );
 ALTER TABLE clear_oracle_prices ADD COLUMN IF NOT EXISTS publish_time BIGINT;
+-- The PythOracleAdapter's per-asset override of the widest confidence interval
+-- (conf/price, bps) it relays (AssetMaxConfidenceBpsUpdated). NULL = the adapter's
+-- global default applies. A ClearOraclePriceInvalidated resets price to 0 and
+-- publish_time to NULL, mirroring the contract (reads revert until a fresh update).
+ALTER TABLE clear_oracle_prices ADD COLUMN IF NOT EXISTS max_confidence_bps NUMERIC;
 
 -- Oracle price time series: one row per ClearOracleRateChanged (every price write,
 -- including Pyth-driven ones, funnels through it). Append-only, for charting price
@@ -422,15 +453,23 @@ CREATE TABLE IF NOT EXISTS clear_curve_liquidity (
 );
 CREATE INDEX IF NOT EXISTS clear_curve_liquidity_pool_block ON clear_curve_liquidity (chain_id, pool, block_number);
 
--- Reserve valuation, in normalized 18-decimal par units. Two layers, because a
--- meta reserve's BaseLP leg is priced at the BASE reserve's NAV/share and the
--- base reserve therefore has to be valued first. Dropped and recreated on every
--- migration so a column change is not a manual step (CREATE OR REPLACE VIEW
--- refuses one).
+-- Reserve valuation, in normalized 18-decimal units. Two layers, because a meta
+-- reserve's BaseLP leg is priced off the BASE reserve's NAV/share and redemption
+-- price, and the base reserve therefore has to be valued first. Dropped and
+-- recreated on every migration so a column change is not a manual step (CREATE OR
+-- REPLACE VIEW refuses one).
+--
+-- Redemption prices come from clear_oracle_prices.redemption_price (oracle units,
+-- 8 decimals — the contracts scale them by ORACLE_PRICE_SCALE = 1e10 to 18). An
+-- asset the oracle tables do not know yet is taken at par (1e18), so a deployment
+-- that does not index the ClearOracle still gets the par figures.
 --
 -- Layer 1 values every leg at par. That IS the definition for a base reserve
 -- (ClearBaseReserve.totalAssets / totalIOUDebt / totalReserveValue); for a meta
--- reserve it is only an intermediate and layer 2 replaces it.
+-- reserve it is only an intermediate and layer 2 replaces it. It also carries the
+-- base reserve's avg_redemption (averagePriceAndRedemptionPrice): the redemption
+-- price of each asset weighted by its NET par balance (accounted balance minus its
+-- IOU supply, floored at 0), 0 when no asset has a net balance, NULL on a meta row.
 DROP VIEW IF EXISTS clear_reserve_values CASCADE;
 DROP VIEW IF EXISTS clear_reserve_par_values CASCADE;
 CREATE VIEW clear_reserve_par_values AS
@@ -441,7 +480,10 @@ SELECT
     r.lp_supply,
     COALESCE(g.value, 0) AS gross_assets,
     COALESCE(d.value, 0) AS iou_debt,
-    GREATEST(COALESCE(g.value, 0) - COALESCE(d.value, 0), 0) AS nav
+    GREATEST(COALESCE(g.value, 0) - COALESCE(d.value, 0), 0) AS nav,
+    CASE WHEN r.kind <> 'base' THEN NULL
+         WHEN COALESCE(w.net_par, 0) = 0 THEN 0
+         ELSE trunc(w.weighted / w.net_par) END AS avg_redemption
 FROM clear_reserves r
 LEFT JOIN LATERAL (
     SELECT sum(b.balance * power(10::numeric, 18 - COALESCE(a.decimals, 18))) AS value
@@ -454,15 +496,35 @@ LEFT JOIN LATERAL (
     SELECT sum(COALESCE(a.iou_supply, 0) * power(10::numeric, 18 - COALESCE(a.decimals, 18))) AS value
     FROM clear_reserve_assets a
     WHERE a.chain_id = r.chain_id AND a.reserve = r.address
-) d ON TRUE;
+) d ON TRUE
+LEFT JOIN LATERAL (
+    SELECT sum(n.par) AS net_par,
+           sum(n.par * COALESCE(o.redemption_price * 10000000000, 1000000000000000000)) AS weighted
+    FROM (
+        SELECT a.chain_id, a.asset,
+               GREATEST(COALESCE(b.balance, 0) - COALESCE(a.iou_supply, 0), 0)
+                 * power(10::numeric, 18 - COALESCE(a.decimals, 18)) AS par
+        FROM clear_reserve_assets a
+        LEFT JOIN clear_reserve_token_balances b
+          ON b.chain_id = a.chain_id AND b.reserve = a.reserve AND b.asset = a.asset
+        WHERE a.chain_id = r.chain_id AND a.reserve = r.address
+    ) n
+    LEFT JOIN clear_oracle_prices o ON o.chain_id = n.chain_id AND o.asset = n.asset
+) w ON r.kind = 'base';
 
--- Layer 2 is the figure each contract actually reports. For a meta reserve the
--- native leg stays at par (ClearMetaReserve.nativeValue) while the BaseLP leg —
--- the leg whose asset IS a base reserve — is converted at that reserve's NAV/share
--- (baseLpValue -> IClearBaseReserve.convertToValue), including the +1/+1 virtual
--- offset the contract prices shares with. Its IOU debt is netted the same way.
--- Multiply before dividing and trunc() the quotient, so the result matches the
--- contract's integer arithmetic exactly rather than drifting by a rounding step.
+-- Layer 2 is the figure each contract actually reports. A base reserve passes
+-- through. A meta reserve values both legs — and the IOU supply against each — on
+-- the redemption basis (ClearMetaReserve._legValueOf):
+--   native leg: units * 10^(18-decimals) * redemption * 1e10 / 1e18
+--   BaseLP leg (the leg whose asset IS a base reserve):
+--               IClearBaseReserve.convertToRedemptionValue(units)
+--             = convertToValue(units) * avg_redemption / 1e18, where
+--               convertToValue(units) = units * (nav + 1) / (lp_supply + 1)
+--               (the +1/+1 virtual offset the contract prices shares with).
+-- Multiply before dividing and trunc() each quotient where the contract divides,
+-- so the result matches its integer arithmetic exactly rather than drifting by a
+-- rounding step. A base-side or oracle move only reaches a meta reserve's stored
+-- snapshot at the meta reserve's next event (see snapshotReserveValue).
 CREATE VIEW clear_reserve_values AS
 SELECT
     p.chain_id,
@@ -478,18 +540,26 @@ FROM clear_reserve_par_values p
 LEFT JOIN LATERAL (
     SELECT
         sum(CASE WHEN base.address IS NULL
-                 THEN COALESCE(b.balance, 0) * power(10::numeric, 18 - COALESCE(a.decimals, 18))
-                 ELSE trunc(COALESCE(b.balance, 0) * (base.nav + 1) / (base.lp_supply + 1))
+                 THEN trunc(COALESCE(b.balance, 0) * power(10::numeric, 18 - COALESCE(a.decimals, 18))
+                            * COALESCE(o.redemption_price * 10000000000, 1000000000000000000)
+                            / 1000000000000000000)
+                 ELSE trunc(trunc(COALESCE(b.balance, 0) * (base.nav + 1) / (base.lp_supply + 1))
+                            * base.avg_redemption / 1000000000000000000)
             END) AS gross_assets,
         sum(CASE WHEN base.address IS NULL
-                 THEN COALESCE(a.iou_supply, 0) * power(10::numeric, 18 - COALESCE(a.decimals, 18))
-                 ELSE trunc(COALESCE(a.iou_supply, 0) * (base.nav + 1) / (base.lp_supply + 1))
+                 THEN trunc(COALESCE(a.iou_supply, 0) * power(10::numeric, 18 - COALESCE(a.decimals, 18))
+                            * COALESCE(o.redemption_price * 10000000000, 1000000000000000000)
+                            / 1000000000000000000)
+                 ELSE trunc(trunc(COALESCE(a.iou_supply, 0) * (base.nav + 1) / (base.lp_supply + 1))
+                            * base.avg_redemption / 1000000000000000000)
             END) AS iou_debt
     FROM clear_reserve_assets a
     LEFT JOIN clear_reserve_token_balances b
       ON b.chain_id = a.chain_id AND b.reserve = a.reserve AND b.asset = a.asset
     LEFT JOIN clear_reserve_par_values base
       ON base.chain_id = a.chain_id AND base.address = a.asset AND base.kind = 'base'
+    LEFT JOIN clear_oracle_prices o
+      ON o.chain_id = a.chain_id AND o.asset = a.asset
     WHERE a.chain_id = p.chain_id AND a.reserve = p.address
 ) m ON p.kind = 'meta';
 `

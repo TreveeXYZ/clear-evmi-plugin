@@ -373,6 +373,47 @@ ON CONFLICT (chain_id, reserve, day) DO UPDATE SET
   total_supply = EXCLUDED.total_supply
 WHERE clear_reserve_value_history.block_number <= EXCLUDED.block_number`,
 		reserve, log.BlockTimestamp, log.BlockNumber, log.ChainId)
+	if err != nil {
+		return err
+	}
+	return snapshotReserveAssets(tx, reserve, log)
+}
+
+// snapshotReserveAssets is the per-asset companion of snapshotReserveValue:
+// one row per (reserve, asset, day) with the balance and IOU supply as they
+// stand, valued with the same expressions clear_reserve_values uses — par for
+// a token (at its redemption price when the oracle has one), the base
+// reserve's NAV per share for a bLP leg.
+func snapshotReserveAssets(tx *sql.Tx, reserve string, log exporter.LogEvent) error {
+	_, err := tx.Exec(`INSERT INTO clear_reserve_asset_history
+(chain_id, reserve, asset, day, block_number, block_timestamp, decimals, balance, iou_supply, value, iou_value)
+SELECT a.chain_id, a.reserve, a.asset, (to_timestamp($2) AT TIME ZONE 'UTC')::date, $3, $2,
+       a.decimals, COALESCE(b.balance, 0), COALESCE(a.iou_supply, 0),
+       CASE WHEN base.address IS NULL
+            THEN TRUNC(COALESCE(b.balance, 0) * POWER(10::numeric, 18 - COALESCE(a.decimals, 18))
+                       * COALESCE(o.redemption_price * 10000000000, 1000000000000000000) / 1000000000000000000)
+            ELSE TRUNC(TRUNC(COALESCE(b.balance, 0) * (base.nav + 1) / (base.lp_supply + 1)) * base.avg_redemption / 1000000000000000000)
+       END,
+       CASE WHEN base.address IS NULL
+            THEN TRUNC(COALESCE(a.iou_supply, 0) * POWER(10::numeric, 18 - COALESCE(a.decimals, 18))
+                       * COALESCE(o.redemption_price * 10000000000, 1000000000000000000) / 1000000000000000000)
+            ELSE TRUNC(TRUNC(COALESCE(a.iou_supply, 0) * (base.nav + 1) / (base.lp_supply + 1)) * base.avg_redemption / 1000000000000000000)
+       END
+FROM clear_reserve_assets a
+LEFT JOIN clear_reserve_token_balances b ON b.chain_id = a.chain_id AND b.reserve = a.reserve AND b.asset = a.asset
+LEFT JOIN clear_reserve_par_values base ON base.chain_id = a.chain_id AND base.address = a.asset AND base.kind = 'base'
+LEFT JOIN clear_oracle_prices o ON o.chain_id = a.chain_id AND o.asset = a.asset
+WHERE a.chain_id = $4 AND a.reserve = $1
+ON CONFLICT (chain_id, reserve, asset, day) DO UPDATE SET
+  block_number = EXCLUDED.block_number,
+  block_timestamp = EXCLUDED.block_timestamp,
+  decimals = EXCLUDED.decimals,
+  balance = EXCLUDED.balance,
+  iou_supply = EXCLUDED.iou_supply,
+  value = EXCLUDED.value,
+  iou_value = EXCLUDED.iou_value
+WHERE clear_reserve_asset_history.block_number <= EXCLUDED.block_number`,
+		reserve, log.BlockTimestamp, log.BlockNumber, log.ChainId)
 	return err
 }
 

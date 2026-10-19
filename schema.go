@@ -347,6 +347,27 @@ CREATE TABLE IF NOT EXISTS clear_reserve_value_history (
 ALTER TABLE clear_reserve_value_history ADD COLUMN IF NOT EXISTS iou_debt NUMERIC;
 ALTER TABLE clear_reserve_value_history ADD COLUMN IF NOT EXISTS nav NUMERIC;
 
+-- Per-asset companion of the value history: what each reserve held of each of
+-- its assets at the end of each UTC day, in the asset's own units, with the
+-- IOU claim on it and both valued the way clear_reserve_values values them
+-- (par for a token, the base reserve's NAV per share for a bLP leg). Written
+-- by the same snapshot as the row above, so the two agree block for block.
+CREATE TABLE IF NOT EXISTS clear_reserve_asset_history (
+    chain_id        BIGINT NOT NULL,
+    reserve         TEXT NOT NULL,
+    asset           TEXT NOT NULL,
+    day             DATE NOT NULL,
+    block_number    BIGINT,
+    block_timestamp BIGINT,
+    decimals        INT,
+    balance         NUMERIC,
+    iou_supply      NUMERIC,
+    value           NUMERIC,
+    iou_value       NUMERIC,
+    PRIMARY KEY (chain_id, reserve, asset, day)
+);
+CREATE INDEX IF NOT EXISTS clear_reserve_asset_history_asset_day ON clear_reserve_asset_history (chain_id, asset, day);
+
 -- Curve StableSwap-NG pools (IOU secondary market; LP token IS the pool).
 -- reserve/base_pool/coin/is_base_pool/deployer come from the ClearCurvePoolDeployer's
 -- PoolDeployed event and stay NULL for a pool indexed from its own logs only.

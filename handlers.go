@@ -177,17 +177,40 @@ func handleTransfer(tx *sql.Tx, log exporter.LogEvent, k contractKind) error {
 		return nil
 	}
 
+	// An IOU's supply is the debt its reserve owes, and the reserve's NAV is
+	// net of it. The IOUMinted / IOURedeemed handlers snapshot the reserve
+	// before this Transfer lands, so the day's row would carry the gross
+	// figure as NAV if the mint were the last event of the day: snapshot
+	// again once the supply is in.
+	resnapshot := func() error {
+		if k != iouKind {
+			return nil
+		}
+		var reserve string
+		err := tx.QueryRow("SELECT reserve FROM clear_reserve_assets WHERE chain_id = $1 AND iou = $2 LIMIT 1", chainID, owner).Scan(&reserve)
+		if err != nil || reserve == "" {
+			return nil // an IOU no reserve-asset row claims yet: nothing to value
+		}
+		return snapshotReserveValue(tx, reserve, log)
+	}
+
 	switch {
 	case isZeroAddr(from): // mint
 		if err := adjustBalance(tx, chainID, balTable, keyCol, owner, to, val, block); err != nil {
 			return err
 		}
-		return addSupply(val)
+		if err := addSupply(val); err != nil {
+			return err
+		}
+		return resnapshot()
 	case isZeroAddr(to): // burn
 		if err := adjustBalance(tx, chainID, balTable, keyCol, owner, from, neg(val), block); err != nil {
 			return err
 		}
-		return addSupply(neg(val))
+		if err := addSupply(neg(val)); err != nil {
+			return err
+		}
+		return resnapshot()
 	default: // transfer
 		if err := adjustBalance(tx, chainID, balTable, keyCol, owner, from, neg(val), block); err != nil {
 			return err

@@ -328,6 +328,9 @@ CREATE TABLE IF NOT EXISTS clear_oracle_price_history (
     price           NUMERIC
 );
 CREATE INDEX IF NOT EXISTS clear_oracle_price_history_asset ON clear_oracle_price_history (chain_id, asset, block_number);
+-- Every asset by block: the readers find the time of a block from the closest
+-- timestamped row at or before it, whatever the asset.
+CREATE INDEX IF NOT EXISTS clear_oracle_price_history_block ON clear_oracle_price_history (chain_id, block_number);
 
 -- Reserve value time series (BASE reserves), DAILY granularity: one row per reserve
 -- per UTC day (day = the block-timestamp's date). total_assets = Σ balance*10^(18-

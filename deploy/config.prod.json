@@ -32,8 +32,8 @@
   "resources": {
     "blockchains": [
       {
-        "name": "sepolia",
-        "chainId": 11155111,
+        "name": "ethereum",
+        "chainId": 1,
         "rpcUrl": "${RPC_URL}",
         "blockRange": 500,
         "blockSlice": 5,
@@ -106,28 +106,28 @@
     "pipelines": [
       {
         "name": "clear-rfq",
-        "blockchain": "sepolia",
+        "blockchain": "ethereum",
         "store": "pg-main"
       }
     ],
     "sources": [
       {
         "pipeline": "clear-rfq",
-        "blockchain": "sepolia",
+        "blockchain": "ethereum",
         "abi": "CurveStableSwapFactoryNG",
         "type": "CONTRACT",
         "enabled": true,
-        "startBlock": 11899132,
-        "address": "0x64871caa9f1d98314f25b0c58e7fccd681532257"
+        "startBlock": 26278245,
+        "address": "0xa671f7f070b6848ec0f0b83d6c7556e671327935"
       },
       {
         "pipeline": "clear-rfq",
-        "blockchain": "sepolia",
+        "blockchain": "ethereum",
         "abi": "ClearReserveFactory",
         "type": "FACTORY",
         "enabled": true,
-        "startBlock": 11899132,
-        "address": "0x412e6550c0fc47445762f345bb92c84032f528f1",
+        "startBlock": 26278245,
+        "address": "0x2b2a51bbf9d3794490b9edda1b2b46d5aefd0a95",
         "factoryRules": [
           {
             "creationFunctionName": "NewClearReserve",
@@ -175,39 +175,39 @@
       },
       {
         "pipeline": "clear-rfq",
-        "blockchain": "sepolia",
+        "blockchain": "ethereum",
         "abi": "ClearAccessManager",
         "type": "CONTRACT",
         "enabled": true,
-        "startBlock": 11899132,
-        "address": "0x98770bbc3be3b91363391af996dde9412e9067c8"
+        "startBlock": 26278245,
+        "address": "0x5601d10ab86d2b119f169232baab39b317dd498e"
       },
       {
         "pipeline": "clear-rfq",
-        "blockchain": "sepolia",
+        "blockchain": "ethereum",
         "abi": "ClearOracle",
         "type": "CONTRACT",
         "enabled": true,
-        "startBlock": 11899132,
-        "address": "0x0c7045e10e58e9790c63a4e11982b15ea65d5f10"
+        "startBlock": 26278245,
+        "address": "0x323f9737f4a2763fa419bd679ce0d7a2bc322a30"
       },
       {
         "pipeline": "clear-rfq",
         "abi": "PythOracleAdapter",
         "type": "CONTRACT",
         "enabled": true,
-        "startBlock": 11899132,
-        "address": "0x1c763b25b6d63f7cd4b01a5dc3f8df4c8a179e8f",
-        "_comment": "PythOracleAdapter of the 2026-10-13 Sepolia deployment of the audited v1.0 (contracts e617136, PR #8)"
+        "startBlock": 26278245,
+        "address": "0x39b548e590ec3b6333a200fa715f9eab04f76858",
+        "_comment": "PythOracleAdapter of the 2026-10-27 mainnet deployment (clear-smart-contracts d89567e, Ignition chain-1, adapter deployed at block 26280515)"
       },
       {
         "pipeline": "clear-rfq",
-        "blockchain": "sepolia",
+        "blockchain": "ethereum",
         "abi": "ClearCurvePoolDeployer",
         "type": "CONTRACT",
         "enabled": true,
-        "startBlock": 11899132,
-        "address": "0x882c866d08c221ebc91c70b00040c52878c21ffe"
+        "startBlock": 26278245,
+        "address": "0xfc68a38e82308bc809612892062b440658c5e89f"
       }
     ],
     "exporters": [
@@ -216,7 +216,7 @@
         "pipeline": "clear-rfq",
         "plugin": "Clear",
         "enabled": true,
-        "startBlock": 11899132,
+        "startBlock": 26278245,
         "pluginConfig": {
           "dsn": "${CLEAR_DB_DSN}",
           "autoMigrate": true
@@ -227,7 +227,7 @@
         "pipeline": "clear-rfq",
         "plugin": "gcp-pubsub",
         "enabled": true,
-        "startBlock": 11899132,
+        "startBlock": 26278245,
         "pluginConfig": {
           "projectId": "clear-prod",
           "topicId": "clear-protocol-events"

@@ -17,13 +17,14 @@
 ARG GO_IMAGE=golang:1.25-bookworm
 
 FROM ${GO_IMAGE} AS server
-# Pinned to the same commit go.mod pins the SDK to (TreveeXYZ/go-evm-indexer is
-# our backup fork of evmi-cloud/go-evm-indexer; sync it before bumping this).
-# f00799f = bb7b39a (shared chain-head poll, upstream PR #7) plus the
-# store-closing fix (upstream PR #8): a stopped exporter or source releases
-# its pool, and the exporter starts its plugin before connecting its store.
+# Built from TreveeXYZ/go-evm-indexer, our fork of evmi-cloud/go-evm-indexer.
+# The pin only has to move with go.mod when pkg/exporter (the SDK) changes.
+# d1d7195 = f00799f (shared chain-head poll, store-closing fix) plus the
+# shared block read (fork PR #2, not upstream): each new block is read once
+# for all sources, and sources and exporters wake on new data instead of on
+# their timers. EVMI_HEAD_SUMMARIES=0 turns the shared read off.
 ARG EVMI_REPO=https://github.com/TreveeXYZ/go-evm-indexer.git
-ARG EVMI_REF=f00799f33f069864beab7853c9946d69bea3d643
+ARG EVMI_REF=d1d7195cc4a46ce20d5a3ece2367da271f85dce5
 RUN git clone --filter=blob:none ${EVMI_REPO} /src \
  && cd /src && git checkout --quiet ${EVMI_REF} \
  && go build -o /evm-indexer ./cmd/evm-indexer

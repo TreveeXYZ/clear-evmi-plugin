@@ -23,8 +23,10 @@ FROM ${GO_IMAGE} AS server
 # shared block read (fork PR #2, not upstream): each new block is read once
 # for all sources, and sources and exporters wake on new data instead of on
 # their timers. EVMI_HEAD_SUMMARIES=0 turns the shared read off.
+# 27dc031 = d1d7195 plus fork PR #3: the SQL store no longer hands the last
+# exported block to the exporters a second time.
 ARG EVMI_REPO=https://github.com/TreveeXYZ/go-evm-indexer.git
-ARG EVMI_REF=d1d7195cc4a46ce20d5a3ece2367da271f85dce5
+ARG EVMI_REF=27dc03189ac36fc0a74da22774d12477eb3495e4
 RUN git clone --filter=blob:none ${EVMI_REPO} /src \
  && cd /src && git checkout --quiet ${EVMI_REF} \
  && go build -o /evm-indexer ./cmd/evm-indexer

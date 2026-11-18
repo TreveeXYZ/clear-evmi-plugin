@@ -28,8 +28,10 @@ FROM ${GO_IMAGE} AS server
 # dd4743f = 27dc031 plus fork PR #4 (the node announces new blocks over
 # WebSocket, the periodic read is timed on the block) and PR #5 (every URL
 # is cut down to its host before it is logged: no provider key in the logs).
+# a0e75d0 = dd4743f plus fork PR #6: the statements the database library
+# logs go through the same cut.
 ARG EVMI_REPO=https://github.com/TreveeXYZ/go-evm-indexer.git
-ARG EVMI_REF=dd4743f6072442af7769877c3192710460e390ef
+ARG EVMI_REF=a0e75d08dd8dc4ba4ebf413ef954d392ecf12cdd
 RUN git clone --filter=blob:none ${EVMI_REPO} /src \
  && cd /src && git checkout --quiet ${EVMI_REF} \
  && go build -o /evm-indexer ./cmd/evm-indexer

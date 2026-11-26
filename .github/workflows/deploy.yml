@@ -33,6 +33,18 @@ jobs:
     # environment gets GCP credentials: a workflow edited on a branch gets nothing.
     environment: production
     steps:
+      # Before any credential: the version is a release tag and nothing else.
+      # It reaches the scripts as a value (env), never pasted into them, so
+      # what is typed in the form cannot become a command.
+      - name: Check the version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::version must be a release tag (vX.Y.Z)"
+            exit 1
+          fi
+
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
@@ -45,8 +57,10 @@ jobs:
           install_components: beta
 
       - name: Roll the chosen version out
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          IMAGE="${REGISTRY}/${SERVICE}:${{ inputs.version }}"
+          IMAGE="${REGISTRY}/${SERVICE}:${VERSION}"
           if [ "$KIND" = "workerpool" ]; then
             gcloud beta run worker-pools update "clear-${SERVICE}" \
               --image="$IMAGE" --region="$REGION"
